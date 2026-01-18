@@ -1,0 +1,42 @@
+[
+  {
+    "id": "evt_1",
+    "title": "Board Meeting",
+    "day": "today",
+    "start": "10:00",
+    "duration": "1h",
+    "type": "fixed"
+  },
+  {
+    "id": "evt_2",
+    "title": "Team Standup",
+    "day": "today",
+    "start": "09:00",
+    "duration": "30m",
+    "type": "fixed"
+  },
+  {
+    "id": "evt_3",
+    "title": "Dentist Appointment",
+    "day": "tomorrow",
+    "start": "14:00",
+    "duration": "1h",
+    "type": "fixed"
+  },
+  {
+    "id": "evt_4",
+    "title": "Client Call - Acme Corp",
+    "day": "tomorrow",
+    "start": "11:00",
+    "duration": "45m",
+    "type": "fixed"
+  },
+  {
+    "id": "evt_5",
+    "title": "Weekly Review",
+    "day": "next",
+    "start": "15:00",
+    "duration": "1h",
+    "type": "fixed"
+  }
+]

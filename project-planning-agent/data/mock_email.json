@@ -1,0 +1,34 @@
+[
+  {
+    "id": "email_1",
+    "subject": "Urgent: Q3 Budget Report",
+    "sender": "cfo@company.com",
+    "body": "Need the Q3 budget report finalized by end of day.",
+    "urgency": "high",
+    "status": "unread"
+  },
+  {
+    "id": "email_2",
+    "subject": "Review: Marketing Proposal",
+    "sender": "marketing@company.com",
+    "body": "Please review the attached marketing proposal when you have a chance.",
+    "urgency": "low",
+    "status": "unread"
+  },
+  {
+    "id": "email_3",
+    "subject": "Action Required: Contract Approval",
+    "sender": "legal@company.com",
+    "body": "The Acme contract needs your signature before the client call.",
+    "urgency": "high",
+    "status": "unread"
+  },
+  {
+    "id": "email_4",
+    "subject": "FYI: Team Offsite Planning",
+    "sender": "hr@company.com",
+    "body": "We're planning a team offsite for next month. Please share your availability.",
+    "urgency": "low",
+    "status": "unread"
+  }
+]
