@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { applyPatch, Operation } from 'fast-json-patch';
-import type { PlannerState, ChatMessage, ToolCall } from './types';
+import type { PlannerState, ChatMessage, ToolCall, VoiceStatus } from './types';
 
 // Default State Helpers
 
@@ -35,6 +35,10 @@ interface Store {
   status: 'idle' | 'thinking' | 'error';
   error: string | null;
   
+  // Voice state
+  voiceMode: boolean;
+  voiceStatus: VoiceStatus;
+  
   // Actions
   setFullState: (snapshot: PlannerState) => void;
   applyDelta: (patch: Operation[]) => void;
@@ -52,6 +56,10 @@ interface Store {
   // Status actions
   setStatus: (status: 'idle' | 'thinking' | 'error') => void;
   setError: (error: string | null) => void;
+  
+  // Voice actions
+  setVoiceMode: (active: boolean) => void;
+  setVoiceStatus: (status: VoiceStatus) => void;
 }
 
 // Store Implementation
@@ -63,6 +71,8 @@ export const usePlannerStore = create<Store>((set, get) => ({
   activeToolCalls: [],
   status: 'idle',
   error: null,
+  voiceMode: false,
+  voiceStatus: 'idle',
 
   // Called on STATE_SNAPSHOT
   setFullState: (snapshot) => set({ plan: snapshot }),
@@ -133,5 +143,9 @@ export const usePlannerStore = create<Store>((set, get) => ({
 
   // Status actions
   setStatus: (status) => set({ status }),
-  setError: (error) => set({ error, status: error ? 'error' : 'idle' })
+  setError: (error) => set({ error, status: error ? 'error' : 'idle' }),
+  
+  // Voice actions
+  setVoiceMode: (active) => set({ voiceMode: active }),
+  setVoiceStatus: (status) => set({ voiceStatus: status })
 }));
