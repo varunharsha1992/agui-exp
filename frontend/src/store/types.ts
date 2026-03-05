@@ -43,3 +43,7 @@ export interface ToolCall {
   name: string;
   status: 'running' | 'completed';
 }
+
+// Voice Mode Types
+
+export type VoiceStatus = 'idle' | 'connecting' | 'connected' | 'error';
