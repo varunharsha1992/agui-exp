@@ -5,7 +5,7 @@ that the server interprets to generate STATE_DELTA events.
 """
 
 import uuid
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from langchain.tools import tool
 
 
@@ -34,8 +34,10 @@ def set_full_plan(
     Example:
         set_full_plan(
             today_tasks=[
-                {"title": "Team Standup", "type": "fixed", "source": "calendar"},
-                {"title": "Review PR", "type": "flexible", "source": "user"}
+                {"title": "Team Standup", "type": "fixed", "source": "calendar",
+                 "start_time": "09:00", "duration_minutes": 30},
+                {"title": "Review PR", "type": "flexible", "source": "user",
+                 "start_time": "10:00", "duration_minutes": 60}
             ],
             tomorrow_tasks=[...],
             next_tasks=[...],
@@ -57,8 +59,12 @@ def set_full_plan(
                 "title": t.get("title", "Untitled"),
                 "type": t.get("type", "flexible"),
                 "status": "pending",
-                "source": t.get("source", "user")
+                "source": t.get("source", "user"),
+                "duration_minutes": t.get("duration_minutes"),
+                "start_time": t.get("start_time"),
             }
+            # Strip None values to keep payloads clean, but always keep required fields
+            task = {k: v for k, v in task.items() if v is not None or k in ("id", "title", "type", "status")}
             processed.append(task)
         return processed
     
@@ -97,15 +103,17 @@ def set_full_plan(
 def move_task_in_plan(
     task_id: str,
     target_day: str,
-    target_index: int = -1
+    target_index: int = -1,
+    start_time: Optional[str] = None,
 ) -> dict:
     """
-    Move a task to a different day.
+    Move a flexible task to a different day, optionally to a specific time slot.
     
     Args:
         task_id: The ID of the task to move
         target_day: 'today', 'tomorrow', or 'next'
         target_index: Position in target column (-1 = append)
+        start_time: New start time as "HH:MM" (optional — server auto-assigns if None)
     
     Returns:
         Result dict with status and details
@@ -118,13 +126,16 @@ def move_task_in_plan(
         }
     
     # Signal success - server generates STATE_DELTA
-    return {
+    result = {
         "status": "success",
         "message": f"Moved task {task_id} to {target_day}",
         "task_id": task_id,
         "target_day": target_day,
-        "target_index": target_index
+        "target_index": target_index,
     }
+    if start_time:
+        result["start_time"] = start_time
+    return result
 
 
 @tool
@@ -132,7 +143,9 @@ def add_task_to_plan(
     title: str,
     day: str,
     source: str = "user",
-    urgency: str = "low"
+    urgency: str = "low",
+    duration_minutes: int = 30,
+    start_time: Optional[str] = None,
 ) -> dict:
     """
     Create a new task from email or user request.
@@ -142,6 +155,8 @@ def add_task_to_plan(
         day: 'today', 'tomorrow', or 'next'
         source: 'email' or 'user'
         urgency: 'high' or 'low'
+        duration_minutes: Task duration in minutes (must be multiple of 30)
+        start_time: Start time as "HH:MM" (optional — server auto-assigns)
     
     Returns:
         Result dict with status and the new task object
@@ -165,14 +180,17 @@ def add_task_to_plan(
         "title": title,
         "type": "flexible",
         "status": "pending",
-        "source": source
+        "source": source,
+        "duration_minutes": duration_minutes,
     }
+    if start_time:
+        new_task["start_time"] = start_time
     
     return {
         "status": "success",
         "message": f"Created task '{title}' in {day}",
         "task": new_task,
-        "day": day
+        "day": day,
     }
 
 
