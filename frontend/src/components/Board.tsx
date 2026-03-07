@@ -48,8 +48,10 @@ export default function Board() {
   return (
     <div className="h-screen flex flex-col">
       {/* Header */}
-      <div className="p-4 border-b border-white/30">
-        <h1 className="text-2xl font-bold text-gray-800">Rolling 3-Day Planner</h1>
+      <div className="p-4 border-b" style={{ borderColor: 'var(--border)' }}>
+        <h1 style={{ fontFamily: 'var(--font-display)', color: 'var(--text-primary)', fontSize: '1.5rem', fontWeight: 600 }}>
+          Rolling 3-Day Planner
+        </h1>
       </div>
 
       {/* Board */}
@@ -63,8 +65,8 @@ export default function Board() {
           
           <DragOverlay>
             {activeTask ? (
-              <div className="glass-card p-3 border-2 border-blue-400 opacity-90">
-                <h4 className="font-medium text-sm text-gray-800">{activeTask.title}</h4>
+              <div className="glass-card p-3 opacity-90" style={{ border: '2px solid var(--tone-accent)' }}>
+                <h4 style={{ fontFamily: 'var(--font-body)', color: 'var(--text-primary)', fontSize: '0.875rem', fontWeight: 500 }}>{activeTask.title}</h4>
               </div>
             ) : null}
           </DragOverlay>

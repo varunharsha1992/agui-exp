@@ -14,19 +14,18 @@ export default function TaskCard({ task, columnId }: TaskCardProps) {
   });
 
   const style = transform
-    ? {
-        transform: `translate3d(${transform.x}px, ${transform.y}px, 0)`,
-      }
+    ? { transform: `translate3d(${transform.x}px, ${transform.y}px, 0)` }
     : undefined;
 
   const isFixed = task.type === 'fixed';
-  const statusColors = {
-    pending: 'border-gray-300',
-    done: 'border-green-300 bg-green-50/50',
-    skipped: 'border-gray-300 opacity-60'
-  };
 
-  const sourceIcons = {
+  const cardStyle = isFixed
+    ? { background: 'var(--fixed-bg)', borderColor: 'var(--fixed-border)', borderWidth: 1, borderStyle: 'solid' }
+    : task.status === 'done'
+    ? { background: 'var(--done-bg)', borderColor: 'var(--done-border)', borderWidth: 1, borderStyle: 'solid' }
+    : { background: 'var(--flex-bg)', borderColor: 'var(--flex-border)', borderWidth: 1, borderStyle: 'dashed' };
+
+  const sourceIcons: Record<string, string> = {
     calendar: '📅',
     email: '📧',
     user: '👤'
@@ -35,13 +34,9 @@ export default function TaskCard({ task, columnId }: TaskCardProps) {
   return (
     <div
       ref={setNodeRef}
-      style={style}
+      style={{ ...style, ...cardStyle, opacity: isDragging ? 0.5 : 1, borderRadius: 6 }}
       {...(!isFixed ? { ...listeners, ...attributes } : {})}
-      className={`
-        glass-card p-3 mb-2 ${isFixed ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'}
-        ${isFixed ? 'border-2 border-blue-400' : statusColors[task.status]}
-        ${isDragging ? 'opacity-50' : ''}
-      `}
+      className={`p-3 mb-2 ${isFixed ? 'cursor-default' : 'cursor-grab active:cursor-grabbing'}`}
     >
       <div className="flex items-start justify-between gap-2">
         <div className="flex-1 min-w-0">
@@ -50,14 +45,26 @@ export default function TaskCard({ task, columnId }: TaskCardProps) {
             {task.source && (
               <span className="text-xs">{sourceIcons[task.source] || '📌'}</span>
             )}
-            <h4 className="font-medium text-sm text-gray-800 truncate">{task.title}</h4>
+            <h4
+              className={task.status === 'done' ? 'line-through' : ''}
+              style={{ fontFamily: 'var(--font-body)', color: 'var(--text-primary)', fontSize: '0.875rem', fontWeight: 500 }}
+            >
+              {task.title}
+            </h4>
           </div>
-          {task.duration && (
-            <p className="text-xs text-gray-500 mt-1">{task.duration}</p>
+          {(task.duration_minutes || task.start_time) && (
+            <p style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-secondary)', fontSize: '0.75rem', marginTop: 4 }}>
+              {task.start_time && `${task.start_time}`}
+              {task.duration_minutes && task.start_time && ' · '}
+              {task.duration_minutes && `${task.duration_minutes}m`}
+            </p>
           )}
         </div>
         {task.status !== 'pending' && (
-          <span className="text-xs px-2 py-0.5 rounded bg-gray-200 text-gray-700">
+          <span
+            className="text-xs px-2 py-0.5 rounded"
+            style={{ background: 'var(--bg-elevated)', color: 'var(--text-secondary)' }}
+          >
             {task.status}
           </span>
         )}
