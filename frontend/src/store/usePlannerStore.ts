@@ -34,6 +34,8 @@ interface Store {
   // UI state
   status: 'idle' | 'thinking' | 'error';
   error: string | null;
+  viewMode: 'kanban' | 'gantt';
+  setViewMode: (mode: 'kanban' | 'gantt') => void;
   
   // Voice state
   voiceMode: boolean;
@@ -86,6 +88,7 @@ export const usePlannerStore = create<Store>((set, get) => ({
   activeToolCalls: [],
   status: 'idle',
   error: null,
+  viewMode: 'kanban',
   voiceMode: false,
   voiceStatus: 'idle',
   mcpAppMessages: [],
@@ -162,6 +165,7 @@ export const usePlannerStore = create<Store>((set, get) => ({
 
   // Status actions
   setStatus: (status) => set({ status }),
+  setViewMode: (mode) => set({ viewMode: mode }),
   setError: (error) => set((state) => ({
     error,
     status: error ? 'error' : state.status === 'error' ? 'idle' : state.status,

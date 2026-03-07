@@ -17,7 +17,8 @@
     "postcss": "^8.5.6",
     "tailwindcss": "^4.1.18",
     "typescript": "~5.9.3",
-    "vite": "^7.2.4"
+    "vite": "^7.2.4",
+    "vitest": "^4.0.18"
   },
   "dependencies": {
     "@ag-ui/client": "^0.0.42",
