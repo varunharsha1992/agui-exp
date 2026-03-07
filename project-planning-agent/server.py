@@ -1084,6 +1084,7 @@ async def apply_action(action_req: ActionRequest):
             payload.get("task_id", ""),
             payload.get("target_day", ""),
             payload.get("target_index", -1),
+            payload.get("start_time"),
         )
 
     if not delta:

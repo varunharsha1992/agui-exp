@@ -141,7 +141,7 @@ export function useAgUiPlanner() {
   }, [store, getAgent]);
 
   // Send move action to backend (no LLM) to keep state in sync
-  const notifyMove = useCallback(async (taskId: string, fromCol: string, toCol: string) => {
+  const notifyMove = useCallback(async (taskId: string, fromCol: string, toCol: string, startTime?: string) => {
     try {
       const threadIdForAction = threadId;
       await fetch(`${BACKEND_URL}/agent/action`, {
@@ -155,6 +155,7 @@ export function useAgUiPlanner() {
           payload: {
             task_id: taskId,
             target_day: toCol,
+            ...(startTime ? { start_time: startTime } : {}),
           },
         }),
       });
