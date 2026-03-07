@@ -48,6 +48,75 @@ from agent_logic import create_planner_agent
 from pydantic import BaseModel
 
 
+def _normalize_duration(duration) -> int:
+    """
+    Convert duration to integer minutes.
+
+    Accepts: "1h" -> 60, "30m" -> 30, "45m" -> 45, 60 -> 60, None -> 30
+    """
+    if duration is None:
+        return 30
+    if isinstance(duration, int):
+        return duration
+    s = str(duration).strip().lower()
+    if s.endswith("h"):
+        try:
+            return int(float(s[:-1]) * 60)
+        except ValueError:
+            return 30
+    if s.endswith("m"):
+        try:
+            return int(s[:-1])
+        except ValueError:
+            return 30
+    try:
+        return int(s)
+    except ValueError:
+        return 30
+
+
+def _assign_slot(existing_tasks: list, duration_minutes: int):
+    """
+    Find the earliest free 15-min-aligned slot on a day, given existing tasks.
+
+    Packs from 09:00, leaves a 15-min buffer after each existing task.
+    Returns "HH:MM" string or None if no slot fits before 19:00.
+
+    Args:
+        existing_tasks: list of objects with .start_time and .duration_minutes
+        duration_minutes: how long the new task needs (already normalized)
+    """
+    WORK_START = 9 * 60    # 09:00 in minutes
+    WORK_END   = 19 * 60   # 19:00 in minutes
+    BUFFER     = 15
+
+    intervals = []
+    for t in existing_tasks:
+        if t.start_time and t.duration_minutes:
+            h, m = map(int, t.start_time.split(":"))
+            start = h * 60 + m
+            intervals.append((start, start + t.duration_minutes))
+    intervals.sort()
+
+    cursor = WORK_START
+    while cursor + duration_minutes <= WORK_END:
+        end = cursor + duration_minutes
+        overlap = any(
+            not (end + BUFFER <= s or cursor >= e + BUFFER)
+            for s, e in intervals
+        )
+        if not overlap:
+            h, m = divmod(cursor, 60)
+            return f"{h:02d}:{m:02d}"
+        blocking_ends = [e for s, e in intervals if not (end <= s or cursor >= e + BUFFER)]
+        if blocking_ends:
+            next_try = max(blocking_ends) + BUFFER
+            cursor = ((next_try + 14) // 15) * 15
+        else:
+            cursor += 15
+    return None
+
+
 app = FastAPI(title="Rolling 3-Day Planner Agent")
 
 # CORS configuration from environment
@@ -75,8 +144,6 @@ _export_store: Dict[str, ExportSession] = {}  # thread_id → ExportSession
 # Pub/sub for state event subscriptions (in production, use Redis pub/sub)
 _subscribers: Dict[str, List[asyncio.Queue]] = {}
 
-# Run locks to serialize /agent runs per thread_id
-_run_locks: Dict[str, asyncio.Lock] = {}
 
 # MCP App Registry: maps agent tool names to MCP App metadata
 # Adding new MCP Apps here automatically makes them renderable in the frontend
@@ -494,6 +561,20 @@ async def stream_agent_events(input_data: RunAgentInput):
     yield run_started_encoded
     # Broadcast to subscribers (needed for voice mode)
     await broadcast_to_subscribers(thread_id, run_started_encoded)
+
+    # 1b. Broadcast the user's message immediately so voice-mode subscribers can
+    #     display it in the chat before the agent finishes processing.
+    if input_data.messages:
+        last_msg = input_data.messages[-1]
+        role = getattr(last_msg, 'role', None) or (last_msg.get('role') if isinstance(last_msg, dict) else None)
+        content = getattr(last_msg, 'content', None) or (last_msg.get('content') if isinstance(last_msg, dict) else None)
+        if role == 'user' and content:
+            user_msg_event = json.dumps({
+                "type": "USER_MESSAGE",
+                "content": content,
+            })
+            user_msg_encoded = f"data: {user_msg_event}\n\n"
+            await broadcast_to_subscribers(thread_id, user_msg_encoded)
 
     # 2. Emit STATE_SNAPSHOT (initial state)
     state_snapshot_event = StateSnapshotEvent(
@@ -932,16 +1013,13 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
 
 async def stream_agent_events_with_lock(input_data: RunAgentInput):
     """
-    Wrapper that serializes runs per thread_id using an asyncio.Lock.
+    Pass-through to stream_agent_events. The lock was removed because
+    async generator finalization doesn't guarantee __aexit__ is called when
+    the HTTP client disconnects, leaving the lock permanently held.
+    LangGraph handles its own concurrency internally.
     """
-    thread_id = input_data.thread_id
-    if thread_id not in _run_locks:
-        _run_locks[thread_id] = asyncio.Lock()
-    lock = _run_locks[thread_id]
-
-    async with lock:
-        async for event in stream_agent_events(input_data):
-            yield event
+    async for event in stream_agent_events(input_data):
+        yield event
 
 
 @app.post("/agent/action")
