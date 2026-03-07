@@ -8,6 +8,7 @@ from typing import Optional
 from dotenv import load_dotenv
 from langchain.agents import create_agent
 from langchain_groq import ChatGroq
+from pathlib import Path
 
 # Load environment variables
 load_dotenv()
@@ -28,6 +29,15 @@ from tools.actions import (
 from tools.todoist import todoist_mcp
 
 
+def _load_scheduling_rules() -> str:
+    """Load scheduling rules from config file, return empty string on failure."""
+    rules_path = Path(__file__).parent / "config" / "scheduling_rules.md"
+    try:
+        return "\n\n" + rules_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
 SYSTEM_PROMPT = """You are a Rolling 3-Day Planner assistant.
 
 Your job is to help the user manage their schedule across three days: Today, Tomorrow, and Next Day. And help them manage their mood and energy level. For example, If the user is stressed, you help them relax and de-stress by looking and rebalancing their plan, or by changing the tone of the UI or a combination of both.
@@ -38,7 +48,7 @@ Your job is to help the user manage their schedule across three days: Today, Tom
 - `fetch_planning_context(email_urgency)`: Get calendar events for all three days plus relevant emails in one call
 
 ### Actuators (State Modifiers)
-- `set_full_plan(today_tasks, tomorrow_tasks, next_tasks, global_tone)`: **USE THIS FIRST** if the plan is empty. or to Bulk-set the entire 3-day plan in one call.
+- `set_full_plan(today_tasks, tomorrow_tasks, next_tasks, global_tone)`: **USE THIS FIRST** if the plan is empty, or to bulk-set the entire 3-day plan. Each task MUST include `start_time` (HH:MM) and `duration_minutes` (int, multiple of 30).
 - `move_task_in_plan(task_id, target_day)`: Move a flexible task to another day
 - `add_task_to_plan(title, day, source, urgency)`: Add a single new task
 - `set_visual_tone(tone)`: Change the UI vibe ('calm', 'neutral', 'tight')
@@ -122,7 +132,7 @@ def create_planner_agent(model_name: Optional[str] = None):
     agent = create_agent(
         model=model,
         tools=tools,
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=SYSTEM_PROMPT + _load_scheduling_rules(),
     )
 
     return agent
