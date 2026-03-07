@@ -2,25 +2,27 @@ import { useCallback, useRef, useEffect } from 'react';
 import { HttpAgent } from '@ag-ui/client';
 import { usePlannerStore } from '../store/usePlannerStore';
 import type { PlannerState } from '../store/types';
+import { useThreadId } from './useThreadId';
 
 const AGENT_URL = import.meta.env.VITE_AGENT_URL || 'http://localhost:8000/agent';
+const BACKEND_URL = import.meta.env.VITE_AGENT_URL?.replace('/agent', '') || 'http://localhost:8000';
 
 export function useAgUiPlanner() {
   const store = usePlannerStore();
+  const threadId = useThreadId(); // Stable thread_id shared with voice mode
   const agentRef = useRef<HttpAgent | null>(null);
-  const threadIdRef = useRef<string>(crypto.randomUUID());
 
   // Initialize the agent with threadId
   const getAgent = useCallback(() => {
     if (!agentRef.current) {
       agentRef.current = new HttpAgent({
         url: AGENT_URL,
-        threadId: threadIdRef.current,
-        initialState: store.plan
+        threadId: threadId,
+        initialState: store.plan,
       });
     }
     return agentRef.current;
-  }, []);
+  }, [threadId, store.plan]);
 
   const sendMessage = useCallback(async (text: string) => {
     const agent = getAgent();
@@ -56,6 +58,7 @@ export function useAgUiPlanner() {
 
         onRunFinishedEvent: () => {
           store.setStatus('idle');
+          store.clearEphemeralAssistant(); // Clear any progress activity
         },
 
         onRunErrorEvent: ({ event }) => {
@@ -72,20 +75,30 @@ export function useAgUiPlanner() {
           store.applyDelta(event.delta);
         },
 
-        // === Text Message Events ===
+        // === Text Message Events (assistant messages only; progress uses ACTIVITY) ===
 
         onTextMessageStartEvent: ({ event }) => {
           store.startAssistantMessage(event.messageId);
         },
 
         onTextMessageContentEvent: ({ event }) => {
-          if (event.messageId) {
-            store.appendToAssistantMessage(event.messageId, event.delta);
-          }
+          if (!event.messageId) return;
+          store.appendToAssistantMessage(event.messageId, event.delta);
         },
 
-        onTextMessageEndEvent: () => {
-          // Message complete, could trigger any finalization logic
+        onTextMessageEndEvent: () => {},
+
+        // === Activity Events (progress is ACTIVITY_SNAPSHOT with activityType PROGRESS) ===
+
+        onActivitySnapshotEvent: ({ event }) => {
+          if (event.activityType !== 'PROGRESS') return;
+          const content = event.content as { text?: string } | undefined;
+          const text = content?.text ?? '';
+          // Only set — never clear mid-run. The last progress text stays
+          // visible until onRunFinishedEvent clears it below.
+          if (text) {
+            store.setEphemeralAssistant(event.messageId, text);
+          }
         },
 
         // === Tool Call Events ===
@@ -96,18 +109,59 @@ export function useAgUiPlanner() {
 
         onToolCallEndEvent: ({ event }) => {
           store.endToolCall(event.toolCallId);
-        }
+        },
+
+        onToolCallResultEvent: ({ event }) => {
+          console.log('[AG-UI] onToolCallResultEvent received:', {
+            toolCallId: event.toolCallId,
+            content: event.content,
+          });
+          try {
+            const result = JSON.parse(event.content || '{}');
+            if (result._mcpApp) {
+              console.log('[AG-UI] _mcpApp detected, adding to store:', {
+                resourceUri: result._mcpApp.resourceUri,
+                mcpServerUrl: result._mcpApp.mcpServerUrl,
+              });
+              store.addMcpAppMessage({
+                toolCallId: event.toolCallId,
+                resourceUri: result._mcpApp.resourceUri,
+                mcpServerUrl: result._mcpApp.mcpServerUrl,
+                toolResult: result,
+              });
+            }
+          } catch {
+            // Not JSON or no _mcpApp — normal tool result, ignore
+          }
+        },
       });
     } catch (error) {
       store.setError(error instanceof Error ? error.message : 'Connection failed');
     }
   }, [store, getAgent]);
 
-  // Send optimistic move to agent for validation
+  // Send move action to backend (no LLM) to keep state in sync
   const notifyMove = useCallback(async (taskId: string, fromCol: string, toCol: string) => {
-    const message = `User moved task ${taskId} from ${fromCol} to ${toCol}`;
-    await sendMessage(message);
-  }, [sendMessage]);
+    try {
+      const threadIdForAction = threadId;
+      await fetch(`${BACKEND_URL}/agent/action`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          thread_id: threadIdForAction,
+          action: 'move_task',
+          payload: {
+            task_id: taskId,
+            target_day: toCol,
+          },
+        }),
+      });
+    } catch (err) {
+      console.error('Failed to apply move_task action:', err);
+    }
+  }, [threadId]);
 
   return {
     // State (read from store)

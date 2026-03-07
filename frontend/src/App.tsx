@@ -1,14 +1,24 @@
 import { useAgUiPlanner } from './hooks/useAgUiPlanner'
+import { useStateSubscription } from './hooks/useStateSubscription'
 import ChatPanel from './components/ChatPanel'
 import Board from './components/Board'
+import MusicPlayer from './components/MusicPlayer'
+
+const TONE_CLASSES: Record<string, string> = {
+  calm: 'tone-calm',
+  neutral: 'tone-neutral',
+  tight: 'tone-tight',
+  happy: 'tone-happy',
+  sad: 'tone-sad',
+  stressed: 'tone-stressed',
+}
 
 function App() {
+  // Subscribe to state changes (works for both chat and voice)
+  useStateSubscription()
+  
   const { plan } = useAgUiPlanner()
-
-  // Determine tone class
-  const toneClass = plan.global_tone === 'calm' ? 'tone-calm' 
-    : plan.global_tone === 'tight' ? 'tone-tight' 
-    : 'tone-neutral'
+  const toneClass = TONE_CLASSES[plan.global_tone] ?? 'tone-neutral'
 
   return (
     <div className={`min-h-screen flex ${toneClass}`}>
@@ -21,6 +31,8 @@ function App() {
       <div className="flex-1">
         <Board />
       </div>
+
+      <MusicPlayer />
     </div>
   )
 }

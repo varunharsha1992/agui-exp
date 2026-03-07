@@ -1,0 +1,9 @@
+livekit-agents[silero]~=1.0
+livekit-plugins-openai
+livekit-plugins-assemblyai
+livekit-plugins-cartesia
+livekit-api
+httpx
+fastapi
+uvicorn
+python-dotenv

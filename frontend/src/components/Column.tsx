@@ -26,7 +26,7 @@ export default function Column({ column }: ColumnProps) {
       `}
     >
       {/* Header */}
-      <div className="mb-4">
+      <div className="mb-4 border-l-4 pl-3" style={{ borderColor: 'var(--tone-accent)' }}>
         <div className="flex items-center justify-between">
           <h3 className="text-lg font-semibold text-gray-800">{column.label}</h3>
           <span className={`text-xs px-2 py-1 rounded ${loadColors[column.load_level]}`}>

@@ -1,6 +1,6 @@
 // Type definitions matching backend schema exactly (snake_case)
 
-export type VisualTone = 'calm' | 'neutral' | 'tight';
+export type VisualTone = 'calm' | 'neutral' | 'tight' | 'happy' | 'sad' | 'stressed';
 export type LoadLevel = 'light' | 'medium' | 'heavy';
 export type TaskType = 'fixed' | 'flexible';
 export type TaskStatus = 'pending' | 'done' | 'skipped';
@@ -47,3 +47,12 @@ export interface ToolCall {
 // Voice Mode Types
 
 export type VoiceStatus = 'idle' | 'connecting' | 'connected' | 'error';
+
+// MCP App Types
+
+export interface McpAppMessage {
+  toolCallId: string;
+  resourceUri: string;
+  mcpServerUrl: string;
+  toolResult: Record<string, unknown>;
+}

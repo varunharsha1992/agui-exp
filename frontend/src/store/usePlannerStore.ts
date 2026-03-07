@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import { applyPatch, Operation } from 'fast-json-patch';
-import type { PlannerState, ChatMessage, ToolCall, VoiceStatus } from './types';
+import type { PlannerState, ChatMessage, ToolCall, VoiceStatus, McpAppMessage } from './types';
 
 // Default State Helpers
 
@@ -38,7 +38,13 @@ interface Store {
   // Voice state
   voiceMode: boolean;
   voiceStatus: VoiceStatus;
-  
+
+  // MCP App state
+  mcpAppMessages: McpAppMessage[];
+
+  // Ephemeral assistant progress bubble
+  ephemeralAssistant: { id: string; content: string } | null;
+
   // Actions
   setFullState: (snapshot: PlannerState) => void;
   applyDelta: (patch: Operation[]) => void;
@@ -48,6 +54,7 @@ interface Store {
   addUserMessage: (content: string) => string;
   startAssistantMessage: (messageId: string) => void;
   appendToAssistantMessage: (messageId: string, delta: string) => void;
+  setMessages: (messages: ChatMessage[]) => void;
   
   // Tool call actions
   startToolCall: (id: string, name: string) => void;
@@ -60,6 +67,14 @@ interface Store {
   // Voice actions
   setVoiceMode: (active: boolean) => void;
   setVoiceStatus: (status: VoiceStatus) => void;
+
+  // MCP App actions
+  addMcpAppMessage: (msg: McpAppMessage) => void;
+  removeMcpAppMessage: (toolCallId: string) => void;
+
+  // Ephemeral assistant actions
+  setEphemeralAssistant: (id: string, content: string) => void;
+  clearEphemeralAssistant: (id?: string) => void;
 }
 
 // Store Implementation
@@ -73,6 +88,8 @@ export const usePlannerStore = create<Store>((set, get) => ({
   error: null,
   voiceMode: false,
   voiceStatus: 'idle',
+  mcpAppMessages: [],
+  ephemeralAssistant: null,
 
   // Called on STATE_SNAPSHOT
   setFullState: (snapshot) => set({ plan: snapshot }),
@@ -132,6 +149,8 @@ export const usePlannerStore = create<Store>((set, get) => ({
     )
   })),
 
+  setMessages: (messages) => set({ messages, currentMessageId: null }),
+
   // Tool call actions
   startToolCall: (id, name) => set((state) => ({
     activeToolCalls: [...state.activeToolCalls, { id, name, status: 'running' }]
@@ -143,9 +162,29 @@ export const usePlannerStore = create<Store>((set, get) => ({
 
   // Status actions
   setStatus: (status) => set({ status }),
-  setError: (error) => set({ error, status: error ? 'error' : 'idle' }),
+  setError: (error) => set((state) => ({
+    error,
+    status: error ? 'error' : state.status === 'error' ? 'idle' : state.status,
+  })),
   
   // Voice actions
   setVoiceMode: (active) => set({ voiceMode: active }),
-  setVoiceStatus: (status) => set({ voiceStatus: status })
+  setVoiceStatus: (status) => set({ voiceStatus: status }),
+
+  // MCP App actions (dedupe by toolCallId: agent stream + subscribe both can emit same result)
+  addMcpAppMessage: (msg) => set((state) => {
+    if (state.mcpAppMessages.some((m) => m.toolCallId === msg.toolCallId)) return state;
+    return { mcpAppMessages: [...state.mcpAppMessages, msg] };
+  }),
+  removeMcpAppMessage: (toolCallId) => set((state) => ({
+    mcpAppMessages: state.mcpAppMessages.filter(m => m.toolCallId !== toolCallId)
+  })),
+
+  // Ephemeral assistant actions
+  setEphemeralAssistant: (id, content) => set(() => ({ ephemeralAssistant: { id, content } })),
+  clearEphemeralAssistant: (id) => set((state) => {
+    if (!state.ephemeralAssistant) return state;
+    if (id && state.ephemeralAssistant.id !== id) return state;
+    return { ephemeralAssistant: null };
+  })
 }));

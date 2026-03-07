@@ -3,14 +3,24 @@
 This is the Translation Layer between LangChain v1 agent and AG-UI protocol.
 """
 
+import json
 import os
 import uuid
+import asyncio
 from typing import Optional, Dict, Any, List
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -28,11 +38,14 @@ from ag_ui.core import (
     TextMessageEndEvent,
     ToolCallStartEvent,
     ToolCallEndEvent,
+    ToolCallResultEvent,
+    ActivitySnapshotEvent,
 )
 from ag_ui.encoder import EventEncoder
 
-from schema import PlannerState, Column, Task, VisualTone, LoadLevel, TaskType, TaskStatus
+from schema import ExportStatus, PlannerState, Column, Task, VisualTone, LoadLevel, TaskType, TaskStatus, ExportSession
 from agent_logic import create_planner_agent
+from pydantic import BaseModel
 
 
 app = FastAPI(title="Rolling 3-Day Planner Agent")
@@ -56,6 +69,23 @@ app.add_middleware(
 
 # Global state storage (in production, use Redis or database)
 _state_store: Dict[str, PlannerState] = {}
+_history_store: Dict[str, List[Dict[str, Any]]] = {}
+_export_store: Dict[str, ExportSession] = {}  # thread_id → ExportSession
+
+# Pub/sub for state event subscriptions (in production, use Redis pub/sub)
+_subscribers: Dict[str, List[asyncio.Queue]] = {}
+
+# Run locks to serialize /agent runs per thread_id
+_run_locks: Dict[str, asyncio.Lock] = {}
+
+# MCP App Registry: maps agent tool names to MCP App metadata
+# Adding new MCP Apps here automatically makes them renderable in the frontend
+_MCP_APP_REGISTRY: Dict[str, Dict[str, str]] = {
+    "todoist_mcp": {
+        "resourceUri": "ui://todoist-planner/editor.html",
+        "mcpServerUrl": os.getenv("MCP_SERVER_URL", "http://localhost:3001/mcp"),
+    }
+}
 
 
 def get_or_create_state(thread_id: str) -> PlannerState:
@@ -90,6 +120,34 @@ def get_or_create_state(thread_id: str) -> PlannerState:
 def update_state(thread_id: str, state: PlannerState):
     """Update the state for a thread."""
     _state_store[thread_id] = state
+
+
+def get_history(thread_id: str) -> List[Dict[str, Any]]:
+    """Get conversation history for a thread."""
+    return _history_store.get(thread_id, [])
+
+
+def update_history(thread_id: str, messages: List[Dict[str, Any]]):
+    """Update conversation history for a thread."""
+    _history_store[thread_id] = messages
+
+
+async def broadcast_to_subscribers(thread_id: str, event_data: str):
+    """Broadcast an event to all subscribers for a thread."""
+    if thread_id in _subscribers:
+        # Remove dead queues (clients that disconnected)
+        active_queues = []
+        for queue in _subscribers[thread_id]:
+            try:
+                queue.put_nowait(event_data)
+                active_queues.append(queue)
+            except asyncio.QueueFull:
+                # Queue full, skip this subscriber
+                pass
+            except Exception:
+                # Queue closed or other error, remove it
+                pass
+        _subscribers[thread_id] = active_queues
 
 
 # =============================================================================
@@ -213,6 +271,196 @@ def apply_delta_to_state(state: PlannerState, delta: List[Dict[str, Any]]) -> Pl
 
 
 # =============================================================================
+# ACTION API MODELS
+# =============================================================================
+
+
+class ActionRequest(BaseModel):
+    thread_id: str
+    action: str
+    payload: Dict[str, Any]
+
+
+# =============================================================================
+# TODOIST MCP INTERCEPTOR
+# =============================================================================
+
+async def _handle_todoist_interceptor(
+    thread_id: str,
+    current_state: PlannerState,
+    result_content: str,
+    tool_info: Dict[str, Any],
+) -> str:
+    """
+    Intercept todoist_mcp tool signals and call the MCP server.
+    Returns the enriched result string for TOOL_CALL_END.
+    """
+    import json
+    import httpx
+    from datetime import datetime
+    from tools.todoist import compute_snapshot
+
+    try:
+        signal = json.loads(result_content) if isinstance(result_content, str) else result_content
+    except (json.JSONDecodeError, TypeError):
+        return str(result_content)
+
+    if not isinstance(signal, dict) or signal.get("action") != "export_to_todoist":
+        return str(result_content)
+
+    project_name = signal.get("project_name", "3-Day Plan")
+    project_id = signal.get("project_id", "")
+
+    # Check for existing export session
+    if not project_id and thread_id in _export_store:
+        existing = _export_store[thread_id]
+        if existing.todoist_project_id:
+            project_id = existing.todoist_project_id
+
+    # Compute snapshot from current planner state
+    snapshot = compute_snapshot(current_state, thread_id)
+
+    # Check for empty plan
+    total_tasks = sum(len(day.tasks) for day in snapshot.days.values())
+    if total_tasks == 0:
+        return json.dumps({
+            "status": "error",
+            "error_type": "empty_plan",
+            "message": "No active tasks to export. Add some tasks to your plan first.",
+        })
+
+    # Call MCP server
+    mcp_url = _MCP_APP_REGISTRY.get("todoist_mcp", {}).get("mcpServerUrl", "http://localhost:3001/mcp")
+
+    mcp_args: Dict[str, Any] = {
+        "project_name": project_name,
+        "snapshot": {
+            "days": {
+                day_key: {
+                    "day": day.day,
+                    "label": day.label,
+                    "tasks": [
+                        {
+                            "planner_id": t.planner_id,
+                            "title": t.title,
+                            "type": t.type,
+                            "order": t.order,
+                            **({"source": t.source} if t.source else {}),
+                            **({"duration": t.duration} if t.duration else {}),
+                        }
+                        for t in day.tasks
+                    ],
+                }
+                for day_key, day in snapshot.days.items()
+            }
+        },
+    }
+    if project_id:
+        mcp_args["project_id"] = project_id
+
+    payload = {
+        "jsonrpc": "2.0",
+        "id": str(uuid.uuid4()),
+        "method": "tools/call",
+        "params": {
+            "name": "write_plan_to_todoist",
+            "arguments": mcp_args,
+        },
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                mcp_url,
+                json=payload,
+                headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+            )
+            response.raise_for_status()
+
+            # Parse response (may be JSON-RPC or SSE)
+            content_type = response.headers.get("content-type", "")
+            if "text/event-stream" in content_type:
+                mcp_result = None
+                for line in response.text.strip().split("\n"):
+                    if line.startswith("data: "):
+                        try:
+                            parsed = json.loads(line[6:])
+                            if "result" in parsed:
+                                mcp_result = parsed["result"]
+                        except json.JSONDecodeError:
+                            pass
+                if not mcp_result:
+                    raise Exception("No valid result in SSE response from MCP server")
+            else:
+                data = response.json()
+                if "error" in data:
+                    raise Exception(f"MCP error: {data['error'].get('message', 'Unknown')}")
+                mcp_result = data.get("result", data)
+
+        # Parse the tool result text content
+        tool_result_text = ""
+        if isinstance(mcp_result, dict) and "content" in mcp_result:
+            for content_item in mcp_result["content"]:
+                if isinstance(content_item, dict) and content_item.get("type") == "text":
+                    tool_result_text = content_item["text"]
+                    break
+
+        result_dict = json.loads(tool_result_text) if tool_result_text else {}
+
+        # Update export session
+        if isinstance(result_dict, dict) and result_dict.get("status") == "success":
+            from schema import ExportSession, ExportStatus
+            session = ExportSession(
+                session_id=str(uuid.uuid4()),
+                thread_id=thread_id,
+                snapshot_id=snapshot.snapshot_id,
+                todoist_project_id=result_dict.get("project_id"),
+                todoist_project_name=project_name,
+                section_mapping=result_dict.get("sections", {}),
+                task_mapping=result_dict.get("task_mapping", {}),
+                status=ExportStatus.WRITTEN,
+            )
+            _export_store[thread_id] = session
+
+            # Enrich with _mcpApp metadata
+            tool_name = "todoist_mcp"
+            if tool_name in _MCP_APP_REGISTRY:
+                result_dict["_mcpApp"] = _MCP_APP_REGISTRY[tool_name]
+
+            return json.dumps(result_dict)
+        else:
+            # Error from MCP server — update session status
+            from schema import ExportStatus
+            if thread_id in _export_store:
+                _export_store[thread_id].status = ExportStatus.ERROR
+                _export_store[thread_id].error = result_dict.get("message", "Unknown error")
+            return tool_result_text or json.dumps(result_dict)
+
+    except httpx.ConnectError:
+        from schema import ExportStatus
+        error_result = {
+            "status": "error",
+            "error_type": "connection_error",
+            "message": "Could not connect to the Todoist MCP server. Make sure it is running on port 3001.",
+        }
+        if thread_id in _export_store:
+            _export_store[thread_id].status = ExportStatus.ERROR
+            _export_store[thread_id].error = error_result["message"]
+        return json.dumps(error_result)
+    except Exception as e:
+        from schema import ExportStatus
+        error_result = {
+            "status": "error",
+            "error_type": "api_error",
+            "message": f"Failed to export to Todoist: {str(e)}",
+        }
+        if thread_id in _export_store:
+            _export_store[thread_id].status = ExportStatus.ERROR
+            _export_store[thread_id].error = str(e)
+        return json.dumps(error_result)
+
+
+# =============================================================================
 # AG-UI EVENT STREAMING
 # =============================================================================
 
@@ -224,8 +472,9 @@ async def stream_agent_events(input_data: RunAgentInput):
     """
     encoder = EventEncoder()
     thread_id = input_data.thread_id
-    run_id = input_data.run_id
-    
+    # run_id must be stable for the whole run: progress message uses progress:{run_id}
+    run_id = input_data.run_id or str(uuid.uuid4())
+    logger.info(f"Stream agent events called for thread_id: {thread_id}, run_id: {run_id}")
     # Get or create current state
     current_state = get_or_create_state(thread_id)
     
@@ -235,22 +484,36 @@ async def stream_agent_events(input_data: RunAgentInput):
         update_state(thread_id, current_state)
     
     # 1. Emit RUN_STARTED
-    yield encoder.encode(
+    run_started_encoded = encoder.encode(
         RunStartedEvent(
             type=EventType.RUN_STARTED,
             thread_id=thread_id,
             run_id=run_id
         )
     )
-    
+    yield run_started_encoded
+    # Broadcast to subscribers (needed for voice mode)
+    await broadcast_to_subscribers(thread_id, run_started_encoded)
+
     # 2. Emit STATE_SNAPSHOT (initial state)
-    yield encoder.encode(
-        StateSnapshotEvent(
-            type=EventType.STATE_SNAPSHOT,
-            snapshot=current_state.model_dump()
-        )
+    state_snapshot_event = StateSnapshotEvent(
+        type=EventType.STATE_SNAPSHOT,
+        snapshot=current_state.model_dump()
     )
-    
+    snapshot_encoded = encoder.encode(state_snapshot_event)
+    yield snapshot_encoded
+    await broadcast_to_subscribers(thread_id, snapshot_encoded)
+
+    # Progress as ACTIVITY_SNAPSHOT (no TEXT_MESSAGE lifecycle → no verify errors).
+    progress_message_id = f"progress:{run_id}"
+    progress_started = False
+    progress_ended = False
+
+    # Initialize before try so except block can safely reference them
+    message_id = str(uuid.uuid4())
+    text_message_started = False
+    assistant_response_text = ""
+
     try:
         # Create agent
         agent = create_planner_agent()
@@ -265,8 +528,10 @@ async def stream_agent_events(input_data: RunAgentInput):
 Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initialize it."""
         
         langchain_messages = [SystemMessage(content=state_context)]
-        
-        for msg in input_data.messages:
+
+        # Only send the last few turns to the LLM to keep prompts small
+        recent_messages = input_data.messages[-5:] if len(input_data.messages) > 5 else input_data.messages
+        for msg in recent_messages:
             if msg.role == "user":
                 langchain_messages.append(HumanMessage(content=msg.content))
             elif msg.role == "assistant":
@@ -274,41 +539,110 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
         
         # Track pending tool calls for STATE_DELTA generation
         pending_tool_calls: Dict[str, Dict[str, Any]] = {}
-        message_id = str(uuid.uuid4())
-        text_message_started = False  # Track if we've sent TEXT_MESSAGE_START
+        # message_id, text_message_started, assistant_response_text initialized above
         
         # Stream Content Blocks from agent.stream()
         # agent.stream() returns a regular generator - use regular for loop
         # (can use regular for inside async generator function)
         from langchain_core.messages import ToolMessage
-        
-        for chunk in agent.stream(
+
+        # Custom progress message per tool (fallback: "Working… {tool_name}")
+        PROGRESS_MESSAGES: Dict[str, str] = {
+            "fetch_planning_context": "Loading your schedule and emails…",
+            "fetch_calendar": "Fetching calendar…",
+            "fetch_emails": "Checking your inbox…",
+            "set_full_plan": "Building your plan…",
+            "move_task_in_plan": "Moving task…",
+            "add_task_to_plan": "Adding task…",
+            "set_visual_tone": "Updating mood…",
+            "mark_task_status": "Updating task status…",
+            "todoist_mcp": "Exporting to Todoist…",
+        }
+
+        from langchain_core.messages import AIMessageChunk
+
+        for stream_mode_name, chunk in agent.stream(
             {"messages": langchain_messages},
-            stream_mode="updates"
+            stream_mode=["updates", "messages"]
         ):
-            # Process each step update
+            # ── "messages" mode: per-token text streaming ──────────────────
+            if stream_mode_name == "messages":
+                msg_chunk, _meta = chunk
+                if not isinstance(msg_chunk, AIMessageChunk):
+                    continue
+                token = msg_chunk.content
+                if not token or not isinstance(token, str):
+                    continue
+                # Clear progress bubble on first real text token
+                if progress_started and not progress_ended:
+                    progress_ended = True
+                    clear_enc = encoder.encode(
+                        ActivitySnapshotEvent(
+                            type=EventType.ACTIVITY_SNAPSHOT,
+                            messageId=progress_message_id,
+                            activityType="PROGRESS",
+                            content={"text": ""},
+                            replace=True,
+                        )
+                    )
+                    yield clear_enc
+                    await broadcast_to_subscribers(thread_id, clear_enc)
+                # Open the text message on the first token
+                if not text_message_started:
+                    yield encoder.encode(
+                        TextMessageStartEvent(
+                            type=EventType.TEXT_MESSAGE_START,
+                            message_id=message_id,
+                            role="assistant"
+                        )
+                    )
+                    text_message_started = True
+                assistant_response_text += token
+                yield encoder.encode(
+                    TextMessageContentEvent(
+                        type=EventType.TEXT_MESSAGE_CONTENT,
+                        message_id=message_id,
+                        delta=token
+                    )   
+                )
+                continue
+
+            # ── "updates" mode: tool calls + state deltas ──────────────────
             for step_name, step_data in chunk.items():
                 messages = step_data.get("messages", [])
                 if not messages:
                     continue
                 
-                # Get the last message from this step
                 last_message = messages[-1]
                 
-                # Handle AIMessage - check for tool_calls and text content
+                # Tool calls emitted by the LLM
                 if hasattr(last_message, 'tool_calls') and last_message.tool_calls:
-                    # Tool calls in AIMessage
                     for tc in last_message.tool_calls:
                         tool_name = tc.get('name', '') if isinstance(tc, dict) else getattr(tc, 'name', '')
                         tool_args = tc.get('args', {}) if isinstance(tc, dict) else getattr(tc, 'args', {})
                         tool_call_id = tc.get('id', str(uuid.uuid4())) if isinstance(tc, dict) else getattr(tc, 'id', str(uuid.uuid4()))
-                        
-                        # Store tool call info for STATE_DELTA generation
+
                         pending_tool_calls[tool_call_id] = {
                             "name": tool_name,
                             "args": tool_args
                         }
-                        
+
+                        progress_text = PROGRESS_MESSAGES.get(
+                            tool_name, f"Working… {tool_name.replace('_', ' ')}"
+                        )
+                        progress_started = True
+                        activity_enc = encoder.encode(
+                            ActivitySnapshotEvent(
+                                type=EventType.ACTIVITY_SNAPSHOT,
+                                messageId=progress_message_id,
+                                activityType="PROGRESS",
+                                content={"text": progress_text},
+                                replace=True,
+                            )
+                        )
+                        yield activity_enc
+                        await broadcast_to_subscribers(thread_id, activity_enc)
+
                         yield encoder.encode(
                             ToolCallStartEvent(
                                 type=EventType.TOOL_CALL_START,
@@ -318,66 +652,65 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
                             )
                         )
                 
-                # Handle text content from AIMessage
-                if hasattr(last_message, 'content') and last_message.content:
-                    text_content = last_message.content
-                    if isinstance(text_content, str) and text_content.strip():
-                        # Start text message if not already started
-                        if not text_message_started:
-                            yield encoder.encode(
-                                TextMessageStartEvent(
-                                    type=EventType.TEXT_MESSAGE_START,
-                                    message_id=message_id,
-                                    role="assistant"
-                                )
-                            )
-                            text_message_started = True
-                        
-                        yield encoder.encode(
-                            TextMessageContentEvent(
-                                type=EventType.TEXT_MESSAGE_CONTENT,
-                                message_id=message_id,
-                                delta=text_content
-                            )
-                        )
-                    elif isinstance(text_content, list):
-                        # Content blocks list
-                        for block in text_content:
-                            if isinstance(block, dict) and block.get('type') == 'text':
-                                text = block.get('text', '')
-                                if text:
-                                    # Start text message if not already started
-                                    if not text_message_started:
-                                        yield encoder.encode(
-                                            TextMessageStartEvent(
-                                                type=EventType.TEXT_MESSAGE_START,
-                                                message_id=message_id,
-                                                role="assistant"
-                                            )
-                                        )
-                                        text_message_started = True
-                                    
-                                    yield encoder.encode(
-                                        TextMessageContentEvent(
-                                            type=EventType.TEXT_MESSAGE_CONTENT,
-                                            message_id=message_id,
-                                            delta=text
-                                        )
-                                    )
-                
                 # Handle ToolMessage - tool execution results
-                if isinstance(last_message, ToolMessage):
-                    tool_call_id = last_message.tool_call_id if hasattr(last_message, 'tool_call_id') else ''
-                    result_content = last_message.content if hasattr(last_message, 'content') else ''
-                    
-                    yield encoder.encode(
-                        ToolCallEndEvent(
-                            type=EventType.TOOL_CALL_END,
-                            tool_call_id=tool_call_id,
-                            tool_call_result=str(result_content) if result_content else ""
+                # Process ALL ToolMessages in this step (agent may run multiple tools in parallel)
+                for msg in messages:
+                    if not isinstance(msg, ToolMessage):
+                        continue
+                    tool_call_id = msg.tool_call_id if hasattr(msg, 'tool_call_id') else ''
+                    result_content = msg.content if hasattr(msg, 'content') else ''
+
+                    # TODOIST INTERCEPTOR: Handle todoist_mcp signal
+                    # Must run BEFORE emitting ToolCallEndEvent so we can enrich the result
+                    enriched_result = str(result_content) if result_content else ""
+                    if tool_call_id and tool_call_id in pending_tool_calls:
+                        tool_info = pending_tool_calls[tool_call_id]
+                        logger.info(f"Tool info: {tool_info}")
+                        if tool_info["name"] == "todoist_mcp":
+                            enriched_result = await _handle_todoist_interceptor(
+                                thread_id, current_state, result_content, tool_info
+                            )
+                            logger.info(f"Enriched result: {enriched_result}")
+
+                    # Emit per AG-UI protocol: TOOL_CALL_END has only tool_call_id.
+                    # When result contains _mcpApp, emit TOOL_CALL_RESULT with content
+                    # (frontend parses event.content for _mcpApp).
+                    try:
+                        result_dict = json.loads(enriched_result) if enriched_result else {}
+                        has_mcp_app = isinstance(result_dict, dict) and "_mcpApp" in result_dict
+                        if has_mcp_app:
+                            logger.info(f"Has MCP app: {result_dict}")
+                    except (json.JSONDecodeError, TypeError):
+                        has_mcp_app = False
+
+                    if has_mcp_app:
+                        yield encoder.encode(
+                            ToolCallEndEvent(
+                                type=EventType.TOOL_CALL_END,
+                                tool_call_id=tool_call_id,
+                            )
                         )
-                    )
-                    
+                        tool_result_msg_id = str(uuid.uuid4())
+                        tool_result_encoded = encoder.encode(
+                            ToolCallResultEvent(
+                                type=EventType.TOOL_CALL_RESULT,
+                                message_id=tool_result_msg_id,
+                                tool_call_id=tool_call_id,
+                                content=enriched_result,
+                                role="tool",
+                            )
+                        )
+                        yield tool_result_encoded
+                        await broadcast_to_subscribers(thread_id, tool_result_encoded)
+                    else:
+                        yield encoder.encode(
+                            ToolCallEndEvent(
+                                type=EventType.TOOL_CALL_END,
+                                tool_call_id=tool_call_id,
+                                tool_call_result=enriched_result
+                            )
+                        )
+
                     # STATE INTERCEPTOR: Convert actuator results to STATE_DELTA
                     if tool_call_id and tool_call_id in pending_tool_calls:
                         tool_info = pending_tool_calls[tool_call_id]
@@ -388,7 +721,6 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
                         
                         # Parse result to check success
                         try:
-                            import json
                             result_dict = json.loads(result_content) if isinstance(result_content, str) else result_content
                             if isinstance(result_dict, dict) and result_dict.get("status") == "success":
                                 
@@ -426,12 +758,14 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
                                         update_state(thread_id, current_state)
                                         
                                         # Emit STATE_SNAPSHOT for full replacement
-                                        yield encoder.encode(
-                                            StateSnapshotEvent(
-                                                type=EventType.STATE_SNAPSHOT,
-                                                snapshot=current_state.model_dump()
-                                            )
+                                        snapshot_event = StateSnapshotEvent(
+                                            type=EventType.STATE_SNAPSHOT,
+                                            snapshot=current_state.model_dump()
                                         )
+                                        snapshot_encoded = encoder.encode(snapshot_event)
+                                        yield snapshot_encoded
+                                        # Broadcast to subscribers
+                                        await broadcast_to_subscribers(thread_id, snapshot_encoded)
                                         # Skip normal delta emission for this tool
                                         del pending_tool_calls[tool_call_id]
                                         continue
@@ -442,12 +776,14 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
                                     current_state = apply_delta_to_state(current_state, delta)
                                     update_state(thread_id, current_state)
                                     
-                                    yield encoder.encode(
-                                        StateDeltaEvent(
-                                            type=EventType.STATE_DELTA,
-                                            delta=delta
-                                        )
+                                    delta_event = StateDeltaEvent(
+                                        type=EventType.STATE_DELTA,
+                                        delta=delta
                                     )
+                                    delta_encoded = encoder.encode(delta_event)
+                                    yield delta_encoded
+                                    # Broadcast to subscribers
+                                    await broadcast_to_subscribers(thread_id, delta_encoded)
                         except (json.JSONDecodeError, TypeError):
                             pass  # Tool result wasn't JSON, skip STATE_DELTA
                         
@@ -462,20 +798,89 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
                     message_id=message_id
                 )
             )
+
+        # Close progress message on normal completion
+        if progress_started and not progress_ended:
+            progress_ended = True
+            clear_enc = encoder.encode(
+                ActivitySnapshotEvent(
+                    type=EventType.ACTIVITY_SNAPSHOT,
+                    messageId=progress_message_id,
+                    activityType="PROGRESS",
+                    content={"text": ""},
+                    replace=True,
+                )
+            )
+            yield clear_enc
+            await broadcast_to_subscribers(thread_id, clear_enc)
+
+        # 4. Save conversation history
+        # Build complete message list: input messages + assistant response
+        all_messages = [
+            {"id": msg.id, "role": msg.role, "content": msg.content}
+            for msg in input_data.messages
+        ]
+        # Add assistant response if we have one
+        if assistant_response_text:
+            all_messages.append({
+                "id": message_id,
+                "role": "assistant",
+                "content": assistant_response_text
+            })
+        update_history(thread_id, all_messages)
         
-        # 4. Emit RUN_FINISHED
-        yield encoder.encode(
+        # 4b. Safeguard: close any remaining tool calls before RUN_FINISHED
+        # (LangGraph stream_mode="updates" may yield tool results in a structure we miss)
+        for tc_id in list(pending_tool_calls.keys()):
+            yield encoder.encode(
+                ToolCallEndEvent(
+                    type=EventType.TOOL_CALL_END,
+                    tool_call_id=tc_id,
+                    tool_call_result=""
+                )
+            )
+            del pending_tool_calls[tc_id]
+        
+        # 5. Emit RUN_FINISHED
+        run_finished_encoded = encoder.encode(
             RunFinishedEvent(
                 type=EventType.RUN_FINISHED,
                 thread_id=thread_id,
                 run_id=run_id
             )
         )
-        
+        yield run_finished_encoded
+        # Broadcast to subscribers (needed for voice mode)
+        await broadcast_to_subscribers(thread_id, run_finished_encoded)
+
     except Exception as e:
         import traceback
         error_message_id = str(uuid.uuid4())
-        
+
+        # Clear progress activity on error
+        if progress_started and not progress_ended:
+            progress_ended = True
+            clear_enc = encoder.encode(
+                ActivitySnapshotEvent(
+                    type=EventType.ACTIVITY_SNAPSHOT,
+                    messageId=progress_message_id,
+                    activityType="PROGRESS",
+                    content={"text": ""},
+                    replace=True,
+                )
+            )
+            yield clear_enc
+            await broadcast_to_subscribers(thread_id, clear_enc)
+
+        # AG-UI requires all text messages to be closed before RUN_FINISHED.
+        if text_message_started:
+            yield encoder.encode(
+                TextMessageEndEvent(
+                    type=EventType.TEXT_MESSAGE_END,
+                    message_id=message_id
+                )
+            )
+
         # Emit error as text message with proper lifecycle
         yield encoder.encode(
             TextMessageStartEvent(
@@ -497,15 +902,86 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
                 message_id=error_message_id
             )
         )
-        
+
+        # Close any remaining tool calls before RUN_FINISHED
+        try:
+            remaining = list(pending_tool_calls.keys()) if pending_tool_calls else []
+        except NameError:
+            remaining = []
+        for tc_id in remaining:
+            yield encoder.encode(
+                ToolCallEndEvent(
+                    type=EventType.TOOL_CALL_END,
+                    tool_call_id=tc_id,
+                    tool_call_result=""
+                )
+            )
+            del pending_tool_calls[tc_id]
+
         # Still emit RUN_FINISHED
-        yield encoder.encode(
+        run_finished_encoded = encoder.encode(
             RunFinishedEvent(
                 type=EventType.RUN_FINISHED,
                 thread_id=thread_id,
                 run_id=run_id
             )
         )
+        yield run_finished_encoded
+        await broadcast_to_subscribers(thread_id, run_finished_encoded)
+
+
+async def stream_agent_events_with_lock(input_data: RunAgentInput):
+    """
+    Wrapper that serializes runs per thread_id using an asyncio.Lock.
+    """
+    thread_id = input_data.thread_id
+    if thread_id not in _run_locks:
+        _run_locks[thread_id] = asyncio.Lock()
+    lock = _run_locks[thread_id]
+
+    async with lock:
+        async for event in stream_agent_events(input_data):
+            yield event
+
+
+@app.post("/agent/action")
+async def apply_action(action_req: ActionRequest):
+    """
+    Lightweight action endpoint for UI-driven state changes (no LLM).
+
+    Currently supports:
+      - action: "move_task" with payload { task_id, target_day, target_index? }
+    """
+    thread_id = action_req.thread_id
+    current_state = get_or_create_state(thread_id)
+
+    delta: List[Dict[str, Any]] = []
+    if action_req.action == "move_task":
+        payload = action_req.payload or {}
+        delta = generate_move_task_delta(
+            current_state,
+            payload.get("task_id", ""),
+            payload.get("target_day", ""),
+            payload.get("target_index", -1),
+        )
+
+    if not delta:
+        # No-op (e.g., invalid task or fixed task); respond success but do not broadcast.
+        return {"status": "no_op"}
+
+    # Apply delta and broadcast STATE_DELTA
+    new_state = apply_delta_to_state(current_state, delta)
+    update_state(thread_id, new_state)
+
+    encoder = EventEncoder()
+    delta_event = StateDeltaEvent(
+        type=EventType.STATE_DELTA,
+        delta=delta,
+    )
+    delta_encoded = encoder.encode(delta_event)
+    await broadcast_to_subscribers(thread_id, delta_encoded)
+
+    return {"status": "success"}
 
 
 @app.post("/agent")
@@ -520,7 +996,7 @@ async def run_agent(request: Request):
         input_data = RunAgentInput.model_validate_json(body)
         
         return StreamingResponse(
-            stream_agent_events(input_data),
+            stream_agent_events_with_lock(input_data),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -556,6 +1032,76 @@ async def get_state_snapshot(thread_id: str):
         )
     
     return StreamingResponse(emit_snapshot(), media_type="text/event-stream")
+
+
+@app.get("/agent/history/{thread_id}")
+async def get_conversation_history(thread_id: str):
+    """
+    Get conversation history for a thread.
+    Used by voice agent to fetch previous chat history.
+    """
+    history = get_history(thread_id)
+    return {
+        "thread_id": thread_id,
+        "messages": history
+    }
+
+
+@app.get("/agent/subscribe/{thread_id}")
+async def subscribe_to_state(thread_id: str):
+    """
+    Subscribe to state changes for a thread.
+    
+    Returns a persistent SSE stream that broadcasts STATE_DELTA and STATE_SNAPSHOT events
+    whenever the state changes (from any source: chat, voice, etc.).
+    """
+    queue = asyncio.Queue()
+    
+    # Register subscriber
+    if thread_id not in _subscribers:
+        _subscribers[thread_id] = []
+    _subscribers[thread_id].append(queue)
+    
+    # Send initial state snapshot
+    encoder = EventEncoder()
+    current_state = get_or_create_state(thread_id)
+    initial_snapshot = encoder.encode(
+        StateSnapshotEvent(
+            type=EventType.STATE_SNAPSHOT,
+            snapshot=current_state.model_dump()
+        )
+    )
+    await queue.put(initial_snapshot)
+    
+    async def event_stream():
+        try:
+            while True:
+                try:
+                    # Wait for events with timeout to allow checking connection status
+                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    yield event
+                except asyncio.TimeoutError:
+                    # Send keepalive comment to prevent connection timeout
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            # Client disconnected
+            pass
+        finally:
+            # Unregister subscriber
+            if thread_id in _subscribers and queue in _subscribers[thread_id]:
+                _subscribers[thread_id].remove(queue)
+                if not _subscribers[thread_id]:
+                    del _subscribers[thread_id]
+    
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        }
+    )
 
 
 @app.get("/health")
