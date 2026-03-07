@@ -225,7 +225,8 @@ def generate_move_task_delta(
     current_state: PlannerState,
     task_id: str,
     target_day: str,
-    target_index: int = -1
+    target_index: int = -1,
+    start_time: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
     Generate JSON Patch for moving a task.
@@ -263,11 +264,22 @@ def generate_move_task_delta(
     from_path = f"/columns/{source_column}/tasks/{task_index}"
     to_path = f"/columns/{target_day}/tasks/-"  # '-' appends to end
     
-    return [{
+    patches = [{
         "op": "move",
         "from": from_path,
         "path": to_path
     }]
+    
+    # If a new start_time was provided, patch it after the move
+    if start_time:
+        target_len = len(current_state.columns[target_day].tasks)
+        patches.append({
+            "op": "replace",
+            "path": f"/columns/{target_day}/tasks/{target_len}/start_time",
+            "value": start_time
+        })
+    
+    return patches
 
 
 def generate_add_task_delta(
@@ -811,13 +823,20 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
                                         current_state,
                                         tool_args.get("task_id", ""),
                                         tool_args.get("target_day", ""),
-                                        tool_args.get("target_index", -1)
+                                        tool_args.get("target_index", -1),
+                                        tool_args.get("start_time"),
                                     )
                                 
                                 elif tool_name == "add_task_to_plan":
                                     task = result_dict.get("task", {})
                                     day = result_dict.get("day", tool_args.get("day", "today"))
                                     if task:
+                                        # Auto-assign start_time if missing
+                                        if not task.get("start_time"):
+                                            existing = current_state.columns.get(day, type('C', (), {'tasks': []})()).tasks
+                                            slot = _assign_slot(existing, task.get("duration_minutes", 30))
+                                            if slot:
+                                                task["start_time"] = slot
                                         delta = generate_add_task_delta(day, task)
                                 
                                 elif tool_name == "set_visual_tone":
@@ -835,6 +854,30 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
                                     # Full plan replacement - emit new STATE_SNAPSHOT
                                     plan = result_dict.get("plan", {})
                                     if plan:
+                                        # Normalize duration and auto-assign slots for all tasks
+                                        for col_key, col in plan.get("columns", {}).items():
+                                            scheduled = []
+                                            for task in col.get("tasks", []):
+                                                # Normalize duration
+                                                task["duration_minutes"] = _normalize_duration(
+                                                    task.get("duration_minutes") or task.get("duration")
+                                                )
+                                                task.pop("duration", None)  # remove legacy field
+                                                
+                                                # Auto-assign start_time if missing
+                                                if not task.get("start_time"):
+                                                    slot = _assign_slot(
+                                                        [type('T', (), {
+                                                            'start_time': t.get('start_time'),
+                                                            'duration_minutes': t.get('duration_minutes')
+                                                        })()
+                                                         for t in scheduled if t.get('start_time')],
+                                                        task["duration_minutes"]
+                                                    )
+                                                    if slot:
+                                                        task["start_time"] = slot
+                                                scheduled.append(task)
+                                        
                                         current_state = PlannerState(**plan)
                                         update_state(thread_id, current_state)
                                         
