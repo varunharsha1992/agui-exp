@@ -11,7 +11,8 @@ export interface Task {
   type: TaskType;
   status: TaskStatus;
   source?: 'calendar' | 'email' | 'user';
-  duration?: string; // e.g., "30m"
+  duration_minutes?: number;
+  start_time?: string;
 }
 
 export interface Column {
