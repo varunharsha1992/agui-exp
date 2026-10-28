@@ -1,5 +1,6 @@
 """Simple script to view state snapshot for a thread."""
 
+import os
 import requests
 import json
 import sys
@@ -7,7 +8,11 @@ import sys
 # Get thread_id from command line or use default
 thread_id = sys.argv[1] if len(sys.argv) > 1 else "sample-thread"
 
-url = f"http://localhost:8000/agent/state/{thread_id}"
+base_url = os.getenv("AGENT_BASE_URL")
+if not base_url:
+    raise SystemExit("Set AGENT_BASE_URL in environment (e.g. your agent base URL) before running.")
+
+url = f"{base_url.rstrip('/')}/agent/state/{thread_id}"
 
 print(f"Fetching state snapshot for thread: {thread_id}")
 print(f"URL: {url}\n")

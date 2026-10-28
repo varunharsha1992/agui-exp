@@ -3,13 +3,13 @@ import { Room, RoomEvent, Track, RemoteParticipant } from 'livekit-client';
 import { usePlannerStore } from '../store/usePlannerStore';
 import { useThreadId } from './useThreadId';
 
-const TOKEN_URL = import.meta.env.VITE_LIVEKIT_TOKEN_URL || 'http://localhost:8001/livekit/token';
-
 export function useVoiceMode() {
   const store = usePlannerStore();
   const threadId = useThreadId(); // Stable thread_id shared with chat mode
   const roomRef = useRef<Room | null>(null);
   const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+  // First agent audio element — used by VoiceOverlay for waveform visualisation
+  const agentAudioRef = useRef<HTMLAudioElement | null>(null);
 
   // Cleanup all audio elements
   const cleanupAudioElements = useCallback(() => {
@@ -39,11 +39,18 @@ export function useVoiceMode() {
 
       // Generate unique identity for this session
       const identity = `user-${crypto.randomUUID().slice(0, 8)}`;
-      const room = 'planner-room';
+      const tokenUrl = import.meta.env.VITE_LIVEKIT_TOKEN_URL;
+      const room = import.meta.env.VITE_LIVEKIT_ROOM_NAME;
+      if (!tokenUrl) {
+        throw new Error('Missing VITE_LIVEKIT_TOKEN_URL. Set it in your frontend .env.');
+      }
+      if (!room) {
+        throw new Error('Missing VITE_LIVEKIT_ROOM_NAME. Set it in your frontend .env.');
+      }
 
       // Fetch token from token server with thread_id
       const tokenResponse = await fetch(
-        `${TOKEN_URL}?identity=${identity}&room=${room}&thread_id=${threadId}`
+        `${tokenUrl}?identity=${identity}&room=${room}&thread_id=${threadId}`
       );
 
       if (!tokenResponse.ok) {
@@ -94,8 +101,14 @@ export function useVoiceMode() {
       // Connect to room
       await livekitRoom.connect(url, token);
 
-      // Enable microphone
-      await livekitRoom.localParticipant.setMicrophoneEnabled(true);
+      // Enable microphone with raw audio constraints so Silero VAD on the
+      // agent side gets full-fidelity audio. Browser echo cancellation /
+      // noise suppression can suppress speech below the VAD threshold.
+      await livekitRoom.localParticipant.setMicrophoneEnabled(true, {
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: true,  // keep AGC so quiet speakers still register
+      });
 
       roomRef.current = livekitRoom;
     } catch (error) {
@@ -118,6 +131,7 @@ export function useVoiceMode() {
         console.error('Error disconnecting from room:', error);
       } finally {
         roomRef.current = null;
+        agentAudioRef.current = null;
         cleanupAudioElements();
         store.setVoiceMode(false);
         store.setVoiceStatus('idle');
@@ -152,6 +166,11 @@ export function useVoiceMode() {
 
     // Store reference for cleanup
     audioElementsRef.current.set(track.sid, audioEl);
+
+    // Keep a ref to the first agent audio element for waveform visualisation
+    if (!agentAudioRef.current) {
+      agentAudioRef.current = audioEl;
+    }
   }, []);
 
   return {
@@ -160,5 +179,7 @@ export function useVoiceMode() {
     connect,
     disconnect,
     toggleVoiceMode,
+    roomRef,
+    agentAudioRef,
   };
 }

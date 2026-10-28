@@ -37,13 +37,47 @@
   --tone-bg-light:  rgba(240, 165, 0, 0.08);
 }
 
-/* Tone overrides — shift accent only, dark base stays constant */
-.tone-calm    { --tone-accent: #4AADE8; --tone-bg-light: rgba(74,173,232,0.08); }
-.tone-neutral { --tone-accent: #F0A500; --tone-bg-light: rgba(240,165,0,0.08); }
-.tone-tight   { --tone-accent: #E85A4A; --tone-bg-light: rgba(232,90,74,0.08); }
-.tone-happy   { --tone-accent: #6BCB77; --tone-bg-light: rgba(107,203,119,0.08); }
-.tone-sad     { --tone-accent: #7B9ED9; --tone-bg-light: rgba(123,158,217,0.08); }
-.tone-stressed{ --tone-accent: #E8A04A; --tone-bg-light: rgba(232,160,74,0.08); }
+/* Tone overrides — accent + subtle surface tint so the shift is perceptible */
+.tone-calm    {
+  --tone-accent:   #4AADE8;
+  --tone-bg-light: rgba(74, 173, 232, 0.08);
+  --bg-base:       #0C1219;
+  --bg-surface:    #131B26;
+  --border:        #1E2D40;
+}
+.tone-neutral {
+  --tone-accent:   #F0A500;
+  --tone-bg-light: rgba(240, 165, 0, 0.08);
+  /* base values — no override needed */
+}
+.tone-tight   {
+  --tone-accent:   #E85A4A;
+  --tone-bg-light: rgba(232, 90, 74, 0.08);
+  --bg-base:       #130E0D;
+  --bg-surface:    #1C1314;
+  --border:        #332020;
+}
+.tone-happy   {
+  --tone-accent:   #6BCB77;
+  --tone-bg-light: rgba(107, 203, 119, 0.08);
+  --bg-base:       #0C1210;
+  --bg-surface:    #131C16;
+  --border:        #1E3022;
+}
+.tone-sad     {
+  --tone-accent:   #7B9ED9;
+  --tone-bg-light: rgba(123, 158, 217, 0.08);
+  --bg-base:       #0D1018;
+  --bg-surface:    #141824;
+  --border:        #1E2438;
+}
+.tone-stressed {
+  --tone-accent:   #E8A04A;
+  --tone-bg-light: rgba(232, 160, 74, 0.08);
+  --bg-base:       #131009;
+  --bg-surface:    #1C1810;
+  --border:        #332A14;
+}
 
 /* Base styles */
 body {
@@ -52,6 +86,17 @@ body {
   font-family: var(--font-body);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  transition: background-color 600ms ease;
+}
+
+/* Tone stripe — 3px accent bar at very top of app */
+.tone-stripe {
+  position: fixed;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+  background: var(--tone-accent);
+  z-index: 100;
+  transition: background 600ms ease;
 }
 
 /* Scrollbar */
@@ -64,6 +109,7 @@ body {
   background: var(--bg-surface);
   border: 1px solid var(--border);
   border-radius: 8px;
+  transition: background 600ms ease, border-color 600ms ease;
 }
 
 /* View transition */

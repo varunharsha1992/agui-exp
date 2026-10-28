@@ -150,7 +150,7 @@ _subscribers: Dict[str, List[asyncio.Queue]] = {}
 _MCP_APP_REGISTRY: Dict[str, Dict[str, str]] = {
     "todoist_mcp": {
         "resourceUri": "ui://todoist-planner/editor.html",
-        "mcpServerUrl": os.getenv("MCP_SERVER_URL", "http://localhost:3001/mcp"),
+        "mcpServerUrl": os.getenv("MCP_SERVER_URL"),
     }
 }
 
@@ -234,6 +234,18 @@ def generate_move_task_delta(
     Returns:
         List of JSON Patch operations (RFC 6902)
     """
+    # Debug: log the state we're searching through
+    all_task_ids = {
+        col_key: [t.id for t in col.tasks]
+        for col_key, col in current_state.columns.items()
+    }
+    logger.info(
+        "generate_move_task_delta: looking for task_id=%s target_day=%s in state=%s",
+        task_id,
+        target_day,
+        all_task_ids,
+    )
+
     # Find the task in the current state
     source_column = None
     task_index = None
@@ -250,14 +262,30 @@ def generate_move_task_delta(
             break
     
     if source_column is None or task_data is None:
+        logger.warning("generate_move_task_delta: task_id=%s NOT FOUND in any column", task_id)
         return []  # Task not found
     
     # Cannot move fixed tasks
     if task_data.type == TaskType.FIXED:
+        logger.warning("generate_move_task_delta: task_id=%s is FIXED, cannot move", task_id)
         return []
     
-    # Don't move if already in target
+    # Already in target column — still allow a start_time update
     if source_column == target_day:
+        if start_time and start_time != task_data.start_time:
+            logger.info(
+                "generate_move_task_delta: task_id=%s already in %s, updating start_time %s → %s",
+                task_id, target_day, task_data.start_time, start_time,
+            )
+            return [{
+                "op": "replace",
+                "path": f"/columns/{target_day}/tasks/{task_index}/start_time",
+                "value": start_time,
+            }]
+        logger.info(
+            "generate_move_task_delta: task_id=%s already in %s with same time, true no-op",
+            task_id, target_day,
+        )
         return []
     
     # Generate the move operation
@@ -270,7 +298,7 @@ def generate_move_task_delta(
         "path": to_path
     }]
     
-    # If a new start_time was provided, patch it after the move
+    # If a new start_time was provided, patch it on the newly appended task
     if start_time:
         target_len = len(current_state.columns[target_day].tasks)
         patches.append({
@@ -409,7 +437,13 @@ async def _handle_todoist_interceptor(
         })
 
     # Call MCP server
-    mcp_url = _MCP_APP_REGISTRY.get("todoist_mcp", {}).get("mcpServerUrl", "http://localhost:3001/mcp")
+    mcp_url = _MCP_APP_REGISTRY.get("todoist_mcp", {}).get("mcpServerUrl")
+    if not mcp_url:
+        return json.dumps({
+            "status": "error",
+            "error_type": "missing_mcp_server_url",
+            "message": "MCP_SERVER_URL is not set. Configure it via environment variables.",
+        })
 
     mcp_args: Dict[str, Any] = {
         "project_name": project_name,
@@ -559,8 +593,16 @@ async def stream_agent_events(input_data: RunAgentInput):
     
     # Update state if provided in input (e.g., from optimistic UI update)
     if input_data.state:
-        current_state = PlannerState(**input_data.state)
-        update_state(thread_id, current_state)
+        try:
+            current_state = PlannerState(**input_data.state)
+            update_state(thread_id, current_state)
+            task_counts = {k: len(v.tasks) for k, v in current_state.columns.items()}
+            logger.info("State from input_data.state: task_counts=%s", task_counts)
+        except Exception as e:
+            logger.warning("Failed to parse input_data.state, using store state: %s", e)
+    else:
+        task_counts = {k: len(v.tasks) for k, v in current_state.columns.items()}
+        logger.info("State from _state_store (no input_data.state): task_counts=%s", task_counts)
     
     # 1. Emit RUN_STARTED
     run_started_encoded = encoder.encode(
@@ -654,7 +696,7 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
 
         from langchain_core.messages import AIMessageChunk
 
-        for stream_mode_name, chunk in agent.stream(
+        async for stream_mode_name, chunk in agent.astream(
             {"messages": langchain_messages},
             stream_mode=["updates", "messages"]
         ):
@@ -698,11 +740,17 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
                         delta=token
                     )   
                 )
+                await asyncio.sleep(0)  # Yield to event loop so uvicorn flushes the chunk
                 continue
 
             # ── "updates" mode: tool calls + state deltas ──────────────────
             for step_name, step_data in chunk.items():
                 messages = step_data.get("messages", [])
+                msg_types = [type(m).__name__ for m in messages] if messages else []
+                logger.info(
+                    "updates step=%s msg_count=%d msg_types=%s",
+                    step_name, len(messages), msg_types,
+                )
                 if not messages:
                     continue
                 
@@ -752,6 +800,12 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
                         continue
                     tool_call_id = msg.tool_call_id if hasattr(msg, 'tool_call_id') else ''
                     result_content = msg.content if hasattr(msg, 'content') else ''
+                    logger.info(
+                        "ToolMessage found: tool_call_id=%s in_pending=%s content_preview=%s",
+                        tool_call_id,
+                        tool_call_id in pending_tool_calls,
+                        str(result_content)[:120],
+                    )
 
                     # TODOIST INTERCEPTOR: Handle todoist_mcp signal
                     # Must run BEFORE emitting ToolCallEndEvent so we can enrich the result
@@ -896,6 +950,24 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
                                 
                                 # Emit STATE_DELTA if we have patches
                                 if delta:
+                                    # Debug: verify we are emitting a delta (esp. for move_task_in_plan)
+                                    try:
+                                        logger.info(
+                                            "STATE_DELTA emitting: thread_id=%s tool=%s tool_call_id=%s ops=%s",
+                                            thread_id,
+                                            tool_name,
+                                            tool_call_id,
+                                            [
+                                                {
+                                                    "op": op.get("op"),
+                                                    "path": op.get("path"),
+                                                    "from": op.get("from"),
+                                                }
+                                                for op in (delta[:5] if isinstance(delta, list) else [])
+                                            ],
+                                        )
+                                    except Exception:
+                                        pass
                                     # Apply to local state for subsequent operations
                                     current_state = apply_delta_to_state(current_state, delta)
                                     update_state(thread_id, current_state)
@@ -908,6 +980,18 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
                                     yield delta_encoded
                                     # Broadcast to subscribers
                                     await broadcast_to_subscribers(thread_id, delta_encoded)
+                                else:
+                                    # Debug: tool succeeded but no delta was generated (no-op move, fixed task, missing id, etc.)
+                                    try:
+                                        logger.info(
+                                            "STATE_DELTA skipped (empty delta): thread_id=%s tool=%s tool_call_id=%s args=%s",
+                                            thread_id,
+                                            tool_name,
+                                            tool_call_id,
+                                            tool_args,
+                                        )
+                                    except Exception:
+                                        pass
                         except (json.JSONDecodeError, TypeError):
                             pass  # Tool result wasn't JSON, skip STATE_DELTA
                         
@@ -954,7 +1038,12 @@ Note: If the plan has no tasks (empty tasks arrays), use set_full_plan to initia
         update_history(thread_id, all_messages)
         
         # 4b. Safeguard: close any remaining tool calls before RUN_FINISHED
-        # (LangGraph stream_mode="updates" may yield tool results in a structure we miss)
+        if pending_tool_calls:
+            logger.warning(
+                "Safeguard closing %d unclosed tool calls: %s",
+                len(pending_tool_calls),
+                list(pending_tool_calls.keys()),
+            )
         for tc_id in list(pending_tool_calls.keys()):
             yield encoder.encode(
                 ToolCallEndEvent(
@@ -1089,6 +1178,15 @@ async def apply_action(action_req: ActionRequest):
 
     if not delta:
         # No-op (e.g., invalid task or fixed task); respond success but do not broadcast.
+        try:
+            logger.info(
+                "ACTION no_op (empty delta): thread_id=%s action=%s payload=%s",
+                thread_id,
+                action_req.action,
+                action_req.payload,
+            )
+        except Exception:
+            pass
         return {"status": "no_op"}
 
     # Apply delta and broadcast STATE_DELTA
@@ -1101,6 +1199,18 @@ async def apply_action(action_req: ActionRequest):
         delta=delta,
     )
     delta_encoded = encoder.encode(delta_event)
+    try:
+        logger.info(
+            "ACTION STATE_DELTA emitting: thread_id=%s action=%s ops=%s",
+            thread_id,
+            action_req.action,
+            [
+                {"op": op.get("op"), "path": op.get("path"), "from": op.get("from")}
+                for op in (delta[:5] if isinstance(delta, list) else [])
+            ],
+        )
+    except Exception:
+        pass
     await broadcast_to_subscribers(thread_id, delta_encoded)
 
     return {"status": "success"}

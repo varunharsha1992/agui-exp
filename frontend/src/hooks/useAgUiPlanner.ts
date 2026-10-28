@@ -4,8 +4,8 @@ import { usePlannerStore } from '../store/usePlannerStore';
 import type { PlannerState } from '../store/types';
 import { useThreadId } from './useThreadId';
 
-const AGENT_URL = import.meta.env.VITE_AGENT_URL || 'http://localhost:8000/agent';
-const BACKEND_URL = import.meta.env.VITE_AGENT_URL?.replace('/agent', '') || 'http://localhost:8000';
+const AGENT_URL = import.meta.env.VITE_AGENT_URL;
+const BACKEND_URL = import.meta.env.VITE_AGENT_URL?.replace('/agent', '');
 
 export function useAgUiPlanner() {
   const store = usePlannerStore();
@@ -15,6 +15,9 @@ export function useAgUiPlanner() {
   // Initialize the agent with threadId
   const getAgent = useCallback(() => {
     if (!agentRef.current) {
+      if (!AGENT_URL) {
+        throw new Error('Missing VITE_AGENT_URL. Set it in your frontend .env.');
+      }
       agentRef.current = new HttpAgent({
         url: AGENT_URL,
         threadId: threadId,
@@ -50,34 +53,44 @@ export function useAgUiPlanner() {
         context: [],
         forwardedProps: null
       }, {
+        onEvent: ({ event }) => {
+          console.log('[AG-UI] raw event:', event.type);
+        },
+
         // === Lifecycle Events ===
         
         onRunStartedEvent: () => {
+          console.log('[AG-UI] RUN_STARTED');
           store.setStatus('thinking');
         },
 
         onRunFinishedEvent: () => {
+          console.log('[AG-UI] RUN_FINISHED');
           store.setStatus('idle');
-          store.clearEphemeralAssistant(); // Clear any progress activity
+          store.clearEphemeralAssistant();
         },
 
         onRunErrorEvent: ({ event }) => {
+          console.warn('[AG-UI] RUN_ERROR:', event.message);
           store.setError(event.message || 'An error occurred');
         },
 
         // === State Events (Core AG-UI) ===
 
         onStateSnapshotEvent: ({ event }) => {
+          console.log('[AG-UI] STATE_SNAPSHOT received');
           store.setFullState(event.snapshot as PlannerState);
         },
 
         onStateDeltaEvent: ({ event }) => {
+          console.log('[AG-UI] STATE_DELTA received:', event.delta);
           store.applyDelta(event.delta);
         },
 
         // === Text Message Events (assistant messages only; progress uses ACTIVITY) ===
 
         onTextMessageStartEvent: ({ event }) => {
+          console.log('[AG-UI] TEXT_MESSAGE_START:', event.messageId);
           store.startAssistantMessage(event.messageId);
         },
 
@@ -86,7 +99,9 @@ export function useAgUiPlanner() {
           store.appendToAssistantMessage(event.messageId, event.delta);
         },
 
-        onTextMessageEndEvent: () => {},
+        onTextMessageEndEvent: () => {
+          console.log('[AG-UI] TEXT_MESSAGE_END');
+        },
 
         // === Activity Events (progress is ACTIVITY_SNAPSHOT with activityType PROGRESS) ===
 
@@ -94,8 +109,7 @@ export function useAgUiPlanner() {
           if (event.activityType !== 'PROGRESS') return;
           const content = event.content as { text?: string } | undefined;
           const text = content?.text ?? '';
-          // Only set — never clear mid-run. The last progress text stays
-          // visible until onRunFinishedEvent clears it below.
+          console.log('[AG-UI] ACTIVITY_SNAPSHOT (PROGRESS):', text || '(cleared)');
           if (text) {
             store.setEphemeralAssistant(event.messageId, text);
           }
@@ -104,10 +118,12 @@ export function useAgUiPlanner() {
         // === Tool Call Events ===
 
         onToolCallStartEvent: ({ event }) => {
+          console.log('[AG-UI] TOOL_CALL_START:', event.toolCallName, event.toolCallId);
           store.startToolCall(event.toolCallId, event.toolCallName);
         },
 
         onToolCallEndEvent: ({ event }) => {
+          console.log('[AG-UI] TOOL_CALL_END:', event.toolCallId);
           store.endToolCall(event.toolCallId);
         },
 
@@ -143,6 +159,9 @@ export function useAgUiPlanner() {
   // Send move action to backend (no LLM) to keep state in sync
   const notifyMove = useCallback(async (taskId: string, fromCol: string, toCol: string, startTime?: string) => {
     try {
+      if (!BACKEND_URL) {
+        throw new Error('Missing VITE_AGENT_URL. Set it in your frontend .env.');
+      }
       const threadIdForAction = threadId;
       await fetch(`${BACKEND_URL}/agent/action`, {
         method: 'POST',

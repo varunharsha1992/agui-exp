@@ -3,7 +3,7 @@ import { usePlannerStore } from '../store/usePlannerStore';
 import { useThreadId } from './useThreadId';
 import type { PlannerState } from '../store/types';
 
-const BACKEND_URL = import.meta.env.VITE_AGENT_URL?.replace('/agent', '') || 'http://localhost:8000';
+const BACKEND_URL = import.meta.env.VITE_AGENT_URL?.replace('/agent', '');
 
 export function useStateSubscription() {
   const threadId = useThreadId();
@@ -11,7 +11,12 @@ export function useStateSubscription() {
 
   useEffect(() => {
     // Get store methods directly - these are stable references
-    const { applyDelta, setFullState, setStatus, addMcpAppMessage, setMessages, setEphemeralAssistant, clearEphemeralAssistant } = usePlannerStore.getState();
+    const { applyDelta, setFullState, setStatus, addMcpAppMessage, setMessages, setEphemeralAssistant, clearEphemeralAssistant, startToolCall, endToolCall, addUserMessage } = usePlannerStore.getState();
+
+    if (!BACKEND_URL) {
+      // If env isn't configured, fail loudly so the UI doesn't silently appear broken.
+      throw new Error('Missing VITE_AGENT_URL. Set it in your frontend .env.');
+    }
 
     // Create EventSource connection
     const eventSource = new EventSource(
@@ -37,27 +42,51 @@ export function useStateSubscription() {
         } else if (eventType === 'STATE_SNAPSHOT') {
           // Replace entire state
           setFullState(data.snapshot as PlannerState);
+        } else if (eventType === 'USER_MESSAGE') {
+          // Immediately show the user's spoken question in the chat (voice mode).
+          // The backend broadcasts this right after RUN_STARTED, before agent processing.
+          // Guard: skip if the message is already in the store (text mode adds it optimistically).
+          const content: string | undefined = data.content;
+          if (content) {
+            const { messages } = usePlannerStore.getState();
+            const alreadyPresent = messages.some(
+              (m) => m.role === 'user' && m.content === content
+            );
+            if (!alreadyPresent) addUserMessage(content);
+          }
         } else if (eventType === 'RUN_STARTED') {
           // Update status to "thinking" when run starts
           // This is needed for voice mode to show thinking status
           setStatus('thinking');
+        } else if (eventType === 'TOOL_CALL_START') {
+          const id = data.tool_call_id ?? data.toolCallId;
+          const name = data.tool_call_name ?? data.toolCallName;
+          if (id && name) startToolCall(id, name);
+        } else if (eventType === 'TOOL_CALL_END') {
+          const id = data.tool_call_id ?? data.toolCallId;
+          if (id) endToolCall(id);
         } else if (eventType === 'RUN_FINISHED') {
-          // Update status to "idle" when run finishes
           setStatus('idle');
-          // Sync messages from backend so voice Q&A appears in chat panel
-          fetch(`${BACKEND_URL}/agent/history/${threadId}`)
-            .then((res) => res.ok ? res.json() : null)
-            .then((body: { messages?: Array<{ id: string; role: string; content: string }> } | null) => {
-              if (body?.messages && Array.isArray(body.messages)) {
-                const mapped = body.messages.map((m) => ({
-                  id: m.id,
-                  role: m.role as 'user' | 'assistant',
-                  content: m.content ?? ''
-                }));
-                setMessages(mapped);
-              }
-            })
-            .catch((err) => console.error('Failed to fetch history after RUN_FINISHED:', err));
+          clearEphemeralAssistant();
+          // Only sync messages from backend in voice mode.
+          // In chat mode the HttpAgent already streamed messages correctly;
+          // overwriting them here causes a flash / deletion.
+          const { voiceMode } = usePlannerStore.getState();
+          if (voiceMode) {
+            fetch(`${BACKEND_URL}/agent/history/${threadId}`)
+              .then((res) => res.ok ? res.json() : null)
+              .then((body: { messages?: Array<{ id: string; role: string; content: string }> } | null) => {
+                if (body?.messages && Array.isArray(body.messages)) {
+                  const mapped = body.messages.map((m) => ({
+                    id: m.id,
+                    role: m.role as 'user' | 'assistant',
+                    content: m.content ?? ''
+                  }));
+                  setMessages(mapped);
+                }
+              })
+              .catch((err) => console.error('Failed to fetch history after RUN_FINISHED:', err));
+          }
         } else if (eventType === 'TOOL_CALL_RESULT') {
           // MCP app frames (e.g. Todoist) from voice runs – mirror useAgUiPlanner logic
           const toolCallId = data.tool_call_id ?? data.toolCallId;
@@ -77,24 +106,17 @@ export function useStateSubscription() {
             // Not JSON or no _mcpApp — normal tool result, ignore
           }
         } else if (eventType === 'ACTIVITY_SNAPSHOT') {
-          const { voiceMode } = usePlannerStore.getState();
-          if (!voiceMode) return;
+          // No voiceMode guard — guard causes a race where voiceMode is still false
+          // when the first activity arrives right after room connection.
           if ((data.activityType ?? data.activity_type) !== 'PROGRESS') return;
-
           const messageId: string | undefined = data.message_id ?? data.messageId;
           const content = data.content as { text?: string } | undefined;
           const text = content?.text ?? '';
-          if (messageId) {
-            if (text) {
-              setEphemeralAssistant(messageId, text);
-            } else {
-              clearEphemeralAssistant(messageId);
-            }
+          // Only set, never clear mid-run (same rule as useAgUiPlanner).
+          // RUN_FINISHED above clears it.
+          if (messageId && text) {
+            setEphemeralAssistant(messageId, text);
           }
-        } else if (eventType === 'TEXT_MESSAGE_START' || eventType === 'TEXT_MESSAGE_CONTENT' || eventType === 'TEXT_MESSAGE_END') {
-          // Progress no longer sent as text; handled via ACTIVITY_SNAPSHOT
-          const { voiceMode } = usePlannerStore.getState();
-          if (!voiceMode) return;
         }
       } catch (error) {
         console.error('Failed to parse state subscription event:', error);

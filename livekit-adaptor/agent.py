@@ -33,14 +33,15 @@ load_dotenv(dotenv_path=env_path)
 logger = logging.getLogger("voice-agent")
 logger.setLevel(logging.INFO)
 
-# Configuration
-AGUI_BACKEND_URL = os.getenv("AGUI_BACKEND_URL", "http://localhost:8000")
-LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://localhost:7880")
-LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "devkey")
-LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "secret")
-ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY", "apikey")
-CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY")
-ELEVEN_API_KEY = os.getenv("ELEVEN_API_KEY")
+# Configuration (required runtime values should come from environment)
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+AGUI_BACKEND_URL = require_env("AGUI_BACKEND_URL")
 
 
 def convert_livekit_history_to_agui_messages(session_history):
@@ -127,7 +128,7 @@ class PlannerAgent(Agent):
     def __init__(self, thread_id: str, conversation_history: list = None):
         super().__init__(
             instructions="""You are a helpful voice assistant for managing schedules and tasks.
-            When the user asks anything related to their schedule, tasks, calendar, or planning, use the query_planner tool to get information from the planning system.
+            When the user asks anything related to their schedule, tasks, calendar, or planning, use the query_planner tool to get information from the planning system. The tool also helps manage the user's mood and energy level.
 
             Summarize tool output intelligently to Eleven Labs v2 friendly prompt.
             Do NOT repeat every task or number.
@@ -165,8 +166,9 @@ class PlannerAgent(Agent):
     ) -> str:
         """
         Query the planning agent backend for schedule information.
-        Always call this tool when the user asks about their schedule, tasks, calendar, or planning.
+        Always call this tool when the user asks about their schedule, tasks, calendar, or planning. The tool also helps manage the user's mood and energy level.
         Pass the user's complete question or request as the user_query parameter.
+        The tool is the single source for adjusting plans, tasks, calendar, and mood and energy level. So incase the user is stressed or happy, this tool can be called to adjust the tone, relax the plan down maybe a bit as needed.
         
         Args:
             user_query: The complete user's question or request about their schedule
@@ -303,19 +305,33 @@ async def voice_agent_session(ctx: agents.JobContext):
             logger.warning(f"Failed to fetch history: {e}")
     
     # Initialize plugins
-    vad = silero.VAD.load()
-    stt = assemblyai.STT() #use assemblyai for stt
-    tts = cartesia.TTS(model="sonic-3") #use elevenlabs for tts
+    # VAD: high threshold (0.65) so only clear, deliberate speech triggers detection.
+    # The user's device has no hardware echo cancellation, so the agent's TTS
+    # audio leaks back through the mic. A high threshold + long min_speech_duration
+    # filters out the reflected TTS audio.
+    vad = silero.VAD.load(
+        activation_threshold=0.65,
+        min_silence_duration=0.6,
+        min_speech_duration=0.3,
+    )
+    stt = openai.STT()
+    tts = cartesia.TTS(model="sonic-3")
     
     # Create agent with thread_id and history
     agent = PlannerAgent(thread_id=thread_id, conversation_history=history)
     
     # Create agent session
+    # allow_interruptions=False prevents the TTS echo loop entirely:
+    # the agent ignores all audio while speaking, so its own echoed output
+    # can never be mistaken for a user barge-in. The user can still speak
+    # normally once the agent finishes its turn.
     session = AgentSession(
         vad=vad,
         stt=stt,
-        llm=openai.LLM(model="gpt-4o-mini"),  # Minimal LLM for tool routing
+        llm=openai.LLM(model="gpt-4o-mini"),
         tts=tts,
+        allow_interruptions=False,
+        min_endpointing_delay=0.8,
     )
     
     # Connect to room
@@ -362,24 +378,62 @@ async def voice_agent_session(ctx: agents.JobContext):
                 logger.warning(f"Failed to re-fetch history: {e}")
     
     logger.info(f"Starting agent session with final thread_id: {thread_id}")
-    
+
+    # ── Debug: track voice pipeline events ──────────────────────────────────
+    @session.on("user_input_transcribed")
+    def on_transcribed(event):
+        logger.info(f"[STT] Transcribed: '{event.transcript}' (final={event.is_final})")
+
+    @session.on("user_state_changed")
+    def on_user_state(event):
+        logger.info(f"[VAD] User state → {event.old_state} → {event.new_state}")
+
+    @session.on("agent_state_changed")
+    def on_state_changed(event):
+        logger.info(f"[SESSION] Agent state → {event.old_state} → {event.new_state}")
+
+    @session.on("conversation_item_added")
+    def on_item_added(event):
+        role = getattr(event.item, 'role', '?')
+        content = getattr(event.item, 'text_content', None) or str(getattr(event.item, 'content', ''))[:80]
+        logger.info(f"[CONV] Item added: role={role} content={content!r}")
+
+    @session.on("error")
+    def on_error(event):
+        logger.error(f"[SESSION ERROR] {event.error} (source={event.source})")
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Start the session
     await session.start(room=ctx.room, agent=agent)
     
-    # Build context-aware greeting
+    # Build a minimal greeting — DO NOT pass history here.
+    # Passing history caused the LLM to autonomously call query_planner with the
+    # previous question before the user had said anything.
     if history:
-        recent_context = history[-3:]  # Last 3 messages
-        context_summary = "\n".join([f"{m['role']}: {m['content'][:100]}" for m in recent_context])
-        greeting_instructions = f"""The user previously had this conversation:
-    {context_summary}
-
-    Greet them and acknowledge the previous context if relevant."""
-    else:
-        greeting_instructions = "Greet the user and offer to help with their schedule."
+        greeting_instructions = (
+            "Say a brief welcome-back greeting (one sentence). "
+            "Do NOT call any tools. Do NOT summarize past conversations. "
+            "Just let the user know you're ready to help with their schedule."
+        )
+    else:   
+        greeting_instructions = (
+            "Say a brief greeting (one sentence). "
+            "Do NOT call any tools. "
+            "Just let the user know you're ready to help with their schedule."
+        )
 
     await session.generate_reply(instructions=greeting_instructions)
     
     logger.info("Voice agent ready and listening")
+
+    # Keep alive: log participant join/leave so we know if a reconnect happens
+    @ctx.room.on("participant_connected")
+    def on_participant_connected(participant):
+        logger.info(f"[ROOM] Participant connected: {participant.identity}")
+
+    @ctx.room.on("participant_disconnected")
+    def on_participant_disconnected(participant):
+        logger.info(f"[ROOM] Participant disconnected: {participant.identity}")
 
 
 if __name__ == "__main__":

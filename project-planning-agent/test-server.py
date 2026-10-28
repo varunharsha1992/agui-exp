@@ -2,7 +2,13 @@ import requests
 import uuid
 import json
 
-url = "http://localhost:8000/agent"
+import os
+
+base_url = os.getenv("AGENT_BASE_URL")
+if not base_url:
+    raise SystemExit("Set AGENT_BASE_URL in environment before running this script.")
+
+url = f"{base_url.rstrip('/')}/agent"
 
 thread_id = 'sample-thread'
 run_id = 'sample-run'

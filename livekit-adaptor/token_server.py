@@ -6,12 +6,14 @@ This service provides a token endpoint for the frontend to connect to LiveKit ro
 import os
 import json
 from typing import Optional
+from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from livekit import api
 
-load_dotenv()
+env_path = Path(__file__).parent / '.env'
+load_dotenv(dotenv_path=env_path)
 
 app = FastAPI(title="LiveKit Token Server")
 
@@ -25,16 +27,23 @@ app.add_middleware(
 )
 
 # Environment variables
-LIVEKIT_URL = os.getenv("LIVEKIT_URL", "ws://localhost:7880")
-LIVEKIT_API_KEY = os.getenv("LIVEKIT_API_KEY", "devkey")
-LIVEKIT_API_SECRET = os.getenv("LIVEKIT_API_SECRET", "secret")
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+LIVEKIT_URL = require_env("LIVEKIT_URL")
+LIVEKIT_API_KEY = require_env("LIVEKIT_API_KEY")
+LIVEKIT_API_SECRET = require_env("LIVEKIT_API_SECRET")
 TOKEN_SERVER_PORT = int(os.getenv("TOKEN_SERVER_PORT", "8001"))
 
 
 @app.get("/livekit/token")
 async def get_livekit_token(
     identity: str,
-    room: str = "planner-room",
+    room: Optional[str] = None,
     thread_id: Optional[str] = None
 ):
     """
@@ -42,20 +51,27 @@ async def get_livekit_token(
     
     Args:
         identity: User identifier
-        room: Room name to join (default: "planner-room")
+        room: Room name to join (recommended: pass ?room=... from the frontend)
         thread_id: Optional thread ID for state continuity
     
     Returns:
         JSON with token and server URL
     """
     try:
+        effective_room = room or os.getenv("LIVEKIT_ROOM_NAME")
+        if not effective_room:
+            raise HTTPException(
+                status_code=400,
+                detail="Missing LiveKit room name. Provide ?room=... or set LIVEKIT_ROOM_NAME in environment.",
+            )
+
         # Build token with chainable methods
         token_builder = api.AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET) \
             .with_identity(identity) \
             .with_name(f"User {identity}") \
             .with_grants(api.VideoGrants(
                 room_join=True,
-                room=room,
+                room=effective_room,
                 can_publish=True,
                 can_subscribe=True,
                 can_publish_data=True,
@@ -71,7 +87,7 @@ async def get_livekit_token(
         return {
             "token": jwt_token,
             "url": LIVEKIT_URL,
-            "room": room,
+            "room": effective_room,
             "thread_id": thread_id
         }
     except Exception as e:

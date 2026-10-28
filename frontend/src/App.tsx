@@ -21,9 +21,12 @@ function App() {
   const toneClass = TONE_CLASSES[plan.global_tone] ?? 'tone-neutral'
 
   return (
-    <div className={`min-h-screen flex ${toneClass}`}>
+    <div className={`min-h-screen flex ${toneClass}`} style={{ transition: 'background-color 600ms ease' }}>
+      {/* Top accent stripe — changes color with tone */}
+      <div className="tone-stripe" />
+
       {/* Left Panel - Chat (30%) */}
-      <div className="w-[30%] border-r border-white/30 glass-card">
+      <div className="w-[30%] border-r glass-card" style={{ borderColor: 'var(--border)', transition: 'border-color 600ms ease' }}>
         <ChatPanel />
       </div>
 

@@ -17,7 +17,7 @@ from schema import (
     SnapshotTask,
 )
 
-MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:3001/mcp")
+MCP_SERVER_URL = os.getenv("MCP_SERVER_URL")
 
 
 def compute_snapshot(state: PlannerState, thread_id: str, include_skipped: bool = False) -> FinalizedSnapshot:
@@ -43,7 +43,7 @@ def compute_snapshot(state: PlannerState, thread_id: str, include_skipped: bool 
                 title=task.title,
                 type=task.type,
                 source=task.source,
-                duration=task.duration,
+                duration=f"{task.duration_minutes}m" if task.duration_minutes else None,
                 order=idx,
             ))
 
@@ -63,6 +63,9 @@ def compute_snapshot(state: PlannerState, thread_id: str, include_skipped: bool 
 
 async def call_mcp_tool(tool_name: str, arguments: dict) -> dict:
     """Call an MCP server tool via JSON-RPC over HTTP."""
+    if not MCP_SERVER_URL:
+        raise Exception("MCP_SERVER_URL is not set. Configure it via environment variables.")
+
     payload = {
         "jsonrpc": "2.0",
         "id": str(uuid.uuid4()),
